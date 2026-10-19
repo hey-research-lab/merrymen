@@ -212,7 +212,7 @@ describe("optional lore within the existing desk budget", () => {
     assert.deepEqual(target, [TOKEN]);
     assert.equal(result.failed, false);
     assert.equal(result.profile?.source, "token-published metadata");
-    assert.equal(result.profile?.url, `https://explorer.robinhood.com/address/${TOKEN}`);
+    assert.equal(result.profile?.url, `https://robinhoodchain.blockscout.com/token/${TOKEN}`);
     assert.equal(result.profile?.chainId, 4663);
     assert.equal(signal?.aborted, true, "pending index/quota work is cancelled after the preferred source answers");
   });
