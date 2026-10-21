@@ -36,9 +36,18 @@ async function existingColumns(db: Db): Promise<{ columns: Set<string>; sqlite: 
  * so concurrent initializers remain safe. Never cache a successful migration
  * across databases, schema changes, failed setup or a later software upgrade.
  */
-export async function applyLedgerMigrations(db: Db, migrations: readonly string[]): Promise<void> {
+/**
+ * The line said when a non-ALTER migration throws, by its index alone: the statement's text and the
+ * driver's message can quote table contents. Such a migration is still skipped, as before; said, its
+ * failure (an open-time fold that stopped folding, say) is no longer silent.
+ */
+export const ledgerMigrationSkipped = (index: number) =>
+  `[warn] ledger migration #${index} failed and was skipped; the ledger opened without it`;
+
+export async function applyLedgerMigrations(db: Db, migrations: readonly string[],
+  log: (line: string) => void = (line) => console.error(line)): Promise<void> {
   const { columns, sqlite } = await existingColumns(db);
-  for (const ddl of migrations) {
+  for (const [index, ddl] of migrations.entries()) {
     const add = /^ALTER TABLE ([a-z_][a-z0-9_]*) ADD COLUMN ([a-z_][a-z0-9_]*)\s/i.exec(ddl);
     if (add) {
       const key = `${add[1]!.toLowerCase()}.${add[2]!.toLowerCase()}`;
@@ -56,7 +65,7 @@ export async function applyLedgerMigrations(db: Db, migrations: readonly string[
       if (/^ALTER TABLE\b/i.test(ddl)) throw new Error("Unsupported ledger column migration");
       // Preserve the existing compatibility handling for the non-column
       // migrations in this list. Required read indexes are checked separately.
-      try { await db.exec(ddl); } catch { /* existing compatibility migration */ }
+      try { await db.exec(ddl); } catch { log(ledgerMigrationSkipped(index)); }
     }
   }
 }

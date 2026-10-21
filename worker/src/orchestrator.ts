@@ -44,6 +44,7 @@ import { restorePaperCheckpoint, recordPaperRecoveryHealth } from "./paper-check
 import { FLEET_RECOVERY_SCHEMA, recordFleetRecoveryHold, recordFleetSourceVerified, readFleetRecoveryHold, readFleetCommandRefusal, readFleetCommandBoundary, withFleetRecoveryLock, type RecoveryCause } from "./fleet-recovery";
 import { AUTONOMY_HOLDS_SQL, AUTONOMY_TRADE_FUNNEL_SQL, FLEET_RAILS_SQL, autonomyLines, fleetRails, foldFunnel, railsLine, type AgentRailRow, type FleetRails } from "./autonomy-funnel";
 import { guardStdio, lineRedactor } from "./redact-stdio";
+import { redactUrls } from "./redact-urls";
 import { commitOf, heartbeatClock, heartbeatCounts, lastShutdownOf, writeFleetHeartbeat, type FleetSnapshot, type HeartbeatCounts, type LastShutdown } from "./fleet-heartbeat";
 import { recoveryCommandRefused, writeRecoveryCommandBarrier } from "./recovery-command-barrier";
 import { repairHistoricalFills } from "./history-fill-repair";
@@ -86,6 +87,7 @@ import {
 } from "./fleet-drain";
 import { getGrantStore } from "./grant-store";
 import { KILL_DONE_TEXT, honourKillRequest, killRequested, writeKillRequest, type KillOutcome } from "./kill-request";
+import { stopSolanaForKill } from "./solana-kill";
 import { CONTROLS_ARMED_FILE, CONTROL_RECEIPTS_SCHEMA, LEGACY_EVENTS_BOT, armOwnerControls, durablePauseLifted, readControlsEvidence, type ControlScope } from "./recovery-reply-arm";
 import { hostedRecipient, telegramSend } from "./mcp/notify";
 import { getIdentityStore } from "./identity-store";
@@ -144,6 +146,7 @@ import {
   rolloutSummary,
   type RolloutCounts,
 } from "./fleet-rollout";
+import { evmFleetId, fleetIdScope, fleetIdTarget, unsupportedFleetIdLabel } from "./fleet-id";
 import {
   NEW_TENANT_HEADROOM, NEW_TENANT_LOOKS_PER_PASS, admitNewTenant, newTenantRefusal, newTenantRoom, readNewTenantAdmissions, volumeHistory, type NewTenantScope,
 } from "./new-tenant-admission";
@@ -480,8 +483,13 @@ function nextRung(child: Child, aliveUntilMs: number): number {
  * A tenant the new-tenant route has admitted (newTenantAdmissions) is in the
  * rollout like a named one, at MERRYMEN_ROLLOUT_NEW_TENANTS's level as it
  * reads now; the accounting hold is asked first, and still holds it.
+ *
+ * Before either, a tenant whose id is not 0x and 40 hex (fleet-id.ts): held
+ * whatever the rollout says, so no gate above starts or keeps a process for
+ * it. The rollout holds it too; this says why.
  */
 function operatorHold(tenant: string): string | null {
+  if (evmFleetId(tenant.toLowerCase()) === null) return "its id is not a Robinhood Chain address, and this build runs no other chain's tenants";
   if (accountingTenantHeld(tenant)) return "operator accounting maintenance holds this tenant";
   if (rolloutHeld(tenant, process.env, newTenantAdmissions)) return `${FLEET_ROLLOUT_ENV} does not admit this tenant`;
   return null;
@@ -571,7 +579,10 @@ async function refreshNewTenantAdmissions(): Promise<void> {
         "no tenant the list does not name is admitted");
       return;
     }
-    newTenantAdmissions = await readNewTenantAdmissions(db);
+    // A row for a tenant that is not 0x admits nobody (fleet-id.ts), and is said.
+    newTenantAdmissions = await readNewTenantAdmissions(db, (raw) => sayTenantAlert(`admission:${raw}`,
+      `[alert] new tenants: fleet_new_tenant_admissions records ${unsupportedFleetIdLabel(raw)}, which is not a Robinhood Chain address — ` +
+      "this build runs no other chain's tenants, so the record admits nobody and nothing starts for it"));
     newTenantRecordReadable = true;
     sayNewTenantRead(null);
   } catch (e) {
@@ -6022,13 +6033,27 @@ export function setKillConfirmForTest(fn: (tenant: `0x${string}`) => Promise<voi
 }
 
 /**
+ * A Telegram kill stops the tenant's Solana strategy as well as its grant
+ * (the separate Solana worker reads only the binding). It runs after the
+ * grant's removal, and throws when it cannot: the grant stays removed, and the
+ * kill stays pending until a later pass stops Solana.
+ */
+let stopSolana: (tenant: `0x${string}`) => Promise<unknown> = (tenant) => stopSolanaForKill(tenant);
+/** Test seam: replace the Solana stop. */
+export function setSolanaKillForTest(fn: (tenant: `0x${string}`) => Promise<unknown>): void {
+  stopSolana = fn;
+}
+
+/**
  * Carry out one tenant's pending Telegram kill, if it has one. Called from
  * reconcile, from the three-second order ferry and on shutdown. They can
  * overlap, which is safe: the DELETE is conditional and atomic, so exactly
- * one call sees `removed` and confirms to the owner.
+ * one call sees `removed` and confirms to the owner (or, when its Solana stop
+ * failed, the call that finishes it: honourKillRequest). The Robinhood grant
+ * goes first; the Solana stop runs after it on every pass and is idempotent.
  */
 async function honourKill(tenant: `0x${string}`, nowSec: number): Promise<KillOutcome> {
-  const k = await honourKillRequest(getGrantStore(), tenant, childHome(tenant), nowSec);
+  const k = await honourKillRequest(getGrantStore(), tenant, childHome(tenant), nowSec, () => stopSolana(tenant));
   if (k.outcome === "revoked" && k.removed) {
     log(`${tenant}: Telegram kill honoured — grant removed from the store`);
     void confirmKillDone(tenant);
@@ -6040,19 +6065,46 @@ async function honourKill(tenant: `0x${string}`, nowSec: number): Promise<KillOu
     await forgetTgGroups(tenant);
   }
   if (k.outcome === "superseded") log(`${tenant}: a grant signed after the Telegram kill replaces it — arming that one`);
-  if (k.outcome === "failed") log(`${tenant}: Telegram kill pending, could not remove the grant yet (${k.error}) — nothing arms meanwhile`);
+  if (k.outcome === "failed") log(`${tenant}: Telegram kill pending, not carried out yet (${k.error}) — nothing arms meanwhile`);
   return k;
 }
 
-/** Every tenant with a home on this container's disk, whether or not its child is running. */
+/**
+ * Every tenant with a home on this container's disk, whether or not its child is running.
+ *
+ * ANY OTHER NAME THERE IS SAID, never passed over (fleet-id.ts): a home this
+ * build did not make, a Solana tenant's or one in the wrong case (childHome
+ * lowercases). Nothing that reads this list starts a worker in it or wipes
+ * it; a pending kill in one is said as such, since the order ferry and the
+ * drain that read this list cannot carry it out.
+ */
 function childHomeTenants(): `0x${string}`[] {
+  const dir = path.join(merrymenHome(), "children");
   let names: string[];
   try {
-    names = readdirSync(path.join(merrymenHome(), "children"));
+    names = readdirSync(dir);
   } catch {
     return [];
   }
-  return names.filter((n): n is `0x${string}` => /^0x[0-9a-f]{40}$/.test(n));
+  const tenants: `0x${string}`[] = [];
+  for (const name of names) {
+    // Exactly as childHome spells it: 0x, 40 hex, lowercase.
+    if (evmFleetId(name) === name) tenants.push(name as `0x${string}`);
+    else sayUnsupportedHome(dir, name);
+  }
+  return tenants;
+}
+
+/** Once an hour per name (sayTenantAlert), and at once when what it says changes. */
+function sayUnsupportedHome(dir: string, name: string): void {
+  const home = path.join(dir, name);
+  let isHome: boolean;
+  try { isHome = lstatSync(home).isDirectory(); } catch { isHome = false; }
+  const label = `children/${unsupportedFleetIdLabel(name)}`;
+  sayTenantAlert(`home:${name}`, isHome && killRequested(home)
+    ? `[alert] fleet: ${label} holds a pending Telegram kill, and its name is not a Robinhood Chain tenant address — ` +
+      "nothing runs for it here (held, must-stop), and the kill is not carried out from this home; make sure its grant is removed"
+    : `[alert] fleet: ${label} is not a Robinhood Chain tenant home — this build never starts a worker in it or wipes it`);
 }
 
 /**
@@ -6262,6 +6314,12 @@ function drainReleasableLeases(): string[] {
  */
 async function drainFinalPass(home: DrainHome): Promise<FinalPassOutcome> {
   const { tenant, lease } = home;
+  // Never one this build started (operatorHold holds it), and its book is not
+  // one the EVM mirror may copy: signalled like every process, copied never.
+  if (evmFleetId(tenant) === null) {
+    log(`[alert] ${unsupportedFleetIdLabel(tenant)}: not a Robinhood Chain tenant — no final pass; its home is left as it is`);
+    return "skipped";
+  }
   if (haltRequested()) {
     log(`${tenant}: FLEET_HALT is present — no final pass; its home is left for the next owner's spawn once the halt is lifted`);
     return "skipped";
@@ -6422,6 +6480,14 @@ export async function reconcile(): Promise<void> {
   newTenantKillSeen.clear();
   for (const tenant of tenants) {
     const lc = tenant.toLowerCase() as `0x${string}`;
+    // A GRANT WHOSE TENANT IS NOT 0x (fleet-id.ts): must-stop, and said.
+    // operatorHold holds it, so nothing starts and anything running is stood
+    // down below. Its kill is still asked for, as before: that only takes
+    // authority away.
+    if (evmFleetId(lc) === null) {
+      sayTenantAlert(`roster:${tenant}`, `[alert] fleet: the grant roster holds ${unsupportedFleetIdLabel(tenant)}, which is not a Robinhood Chain address — ` +
+        "this build never leases, starts or arms it (held), and anything running for it is stood down");
+    }
     const kill = await honourKill(lc, nowSec);
     if (kill.outcome === "revoked") continue;
     // Any kill request at all, carried out or not: never proved new this pass.
@@ -6886,6 +6952,16 @@ export async function reconcile(): Promise<void> {
       const current = await getGrantStore().get(tenant as `0x${string}`);
       if (current || localMemoryWriterPresent(tenant)) continue;
       const home = childHome(tenant);
+      // A TELEGRAM KILL NOT CARRIED OUT YET KEEPS ITS HOME. Its grant is removed
+      // first (honourKillRequest), so the tenant is no longer wanted while its
+      // Solana stop may still be failing; the pending request is what retries
+      // that stop, and wiped with the home it would never run again. Carried out
+      // now, the home goes below as before; still failing (or its kill state
+      // unreadable, which never clears by itself), only the wipe waits: the
+      // revoked session key's cached copy, the bot token and memory go now, as
+      // for any removed agent, and the home with its request stays for the
+      // order ferry and the next pass.
+      const killPending = killRequested(home) && (await honourKill(tenant, Math.floor(Date.now() / 1000))).outcome === "failed";
       scrubHostedGrantCache(home, current, { nowSec: Math.floor(Date.now() / 1000), writerAbsent: true, hosted: true });
       forgetTgGroupsHome(home, log);
       forgetPersonalMemoryHome(home, log);
@@ -6896,6 +6972,12 @@ export async function reconcile(): Promise<void> {
           rmSync(path.join(home, file), { force: true });
         fsyncDirSync(home);
         log(`${tenant} grant removed — personal memory and cached access cleared; original accounting retained`);
+      } else if (killPending) {
+        // The same copies go; the home and its pending request stay for the next pass.
+        for (const file of ["settings.json", "telegram.json", "telegram-held-groups.json", "heartbeat.json"])
+          rmSync(path.join(home, file), { force: true });
+        fsyncDirSync(home);
+        log(`${tenant} grant removed — personal memory and cached access cleared; the home is kept while its Telegram kill is pending`);
       } else {
         // A pending or consumed book must never be replaced by an empty home.
         if (ledgerSourceBlocked(home) || persistentFleetHome()) continue;
@@ -8130,11 +8212,19 @@ async function runHwmRepairIfAsked(): Promise<void> {
     return;
   }
   const applying = mode === "apply";
+  // BOTH LISTS READ WHOLE, OR NOTHING DONE (fleet-id.ts). Each used to keep
+  // only its entries starting with 0x, so a value naming none (a Solana id, a
+  // typo, a lone comma) came out empty and passed the check below, and an
+  // empty scope is the whole roster: an apply to every tenant.
+  const hwmOnly = fleetIdScope("MERRYMEN_REPAIR_HWM_ONLY", process.env.MERRYMEN_REPAIR_HWM_ONLY);
+  if ("refused" in hwmOnly) { log(`hwm| ${hwmOnly.refused}; nothing was done`); return; }
+  const hwmPhantom = fleetIdScope("MERRYMEN_REPAIR_HWM_PHANTOM_PROFIT", process.env.MERRYMEN_REPAIR_HWM_PHANTOM_PROFIT);
+  if ("refused" in hwmPhantom) { log(`hwm| ${hwmPhantom.refused}; nothing was done`); return; }
   // A FLEET-WIDE APPLY IS NOT A THING. Every write here moves the figure the
   // drawdown breaker divides by and the performance fee is measured against, so
   // it happens to tenants somebody named, one at a time, having read their
   // numbers. `report` may sweep the fleet; `apply` may not.
-  if (applying && !(process.env.MERRYMEN_REPAIR_HWM_ONLY ?? "").trim()) {
+  if (applying && hwmOnly.ids.size === 0) {
     log("hwm| REFUSING to apply without MERRYMEN_REPAIR_HWM_ONLY — name the tenants explicitly");
     return;
   }
@@ -8237,12 +8327,7 @@ async function runHwmRepairIfAsked(): Promise<void> {
     // the window before it can be read — a report that cannot be retrieved is
     // not a report. Names TENANTS, not accounts, because that is what an
     // operator has in front of them.
-    const only = new Set(
-      (process.env.MERRYMEN_REPAIR_HWM_ONLY ?? "")
-        .split(",")
-        .map((s) => s.trim().toLowerCase())
-        .filter((s) => s.startsWith("0x")),
-    );
+    const only = new Set<string>(hwmOnly.ids);
     const scoped = only.size ? roster.filter((r) => only.has(r.tenant.toLowerCase())) : roster;
     if (only.size && scoped.length !== only.size) {
       // LOUD. A named tenant that is not in the roster silently does nothing,
@@ -8290,12 +8375,7 @@ async function runHwmRepairIfAsked(): Promise<void> {
     // recorded fee-history profit is legacy residue. Shogun is the case it
     // exists for — 24.915968 of recorded profit against a book never marked
     // above 25.000000 and a chain lifetime result of 0.000000.
-    const phantomProfit = new Set(
-      (process.env.MERRYMEN_REPAIR_HWM_PHANTOM_PROFIT ?? "")
-        .split(",")
-        .map((t) => t.trim().toLowerCase())
-        .filter((t) => t.startsWith("0x")),
-    );
+    const phantomProfit = new Set<string>(hwmPhantom.ids);
     if (phantomProfit.size) {
       log(
         `hwm| operator declares the fee history phantom for ${phantomProfit.size} named tenant(s): ` +
@@ -8467,14 +8547,15 @@ let resumeClassEntriesRan = false;
  * and that nothing an exit depends on moved while they did.
  */
 async function runResumeClassEntriesIfAsked(): Promise<void> {
-  const want = (process.env.MERRYMEN_RESUME_CLASS_ENTRIES_FOR ?? "").trim().toLowerCase();
-  if (!want) return;
+  const target = fleetIdTarget("MERRYMEN_RESUME_CLASS_ENTRIES_FOR", process.env.MERRYMEN_RESUME_CLASS_ENTRIES_FOR);
+  if (!target) return;
   if (resumeClassEntriesRan) return;
   resumeClassEntriesRan = true;
-  if (!/^0x[0-9a-f]{40}$/.test(want)) {
-    log("resume-entries: MERRYMEN_RESUME_CLASS_ENTRIES_FOR is not an address — refusing to guess");
+  if ("refused" in target) {
+    log(`resume-entries: ${target.refused}`);
     return;
   }
+  const want = target.id;
   try {
     const { HALT_MUST_PRESERVE, mergeResumeEntries } = await import("./enable-class");
     const { getSettingsStore } = await import("./settings-store");
@@ -8540,12 +8621,14 @@ async function runClassPnlRepairIfAsked(): Promise<void> {
     return;
   }
   const applying = mode === "apply";
-  const only = new Set(
-    (process.env.MERRYMEN_REPAIR_CLASS_PNL_ONLY ?? "")
-      .split(",")
-      .map((t) => t.trim().toLowerCase())
-      .filter((t) => t.startsWith("0x")),
-  );
+  // Read whole (fleet-id.ts): an entry that is not 0x refuses the run, where
+  // it used to be dropped and, alone, leave a report of the whole fleet.
+  const scope = fleetIdScope("MERRYMEN_REPAIR_CLASS_PNL_ONLY", process.env.MERRYMEN_REPAIR_CLASS_PNL_ONLY);
+  if ("refused" in scope) {
+    log(`class-pnl| ${scope.refused}; nothing was done`);
+    return;
+  }
+  const only = new Set<string>(scope.ids);
   if (applying && only.size === 0) {
     log("class-pnl| REFUSING to apply without MERRYMEN_REPAIR_CLASS_PNL_ONLY — name the tenants");
     return;
@@ -8778,15 +8861,16 @@ async function runClassPnlRepairIfAsked(): Promise<void> {
  * owner chose. Remove the variable as soon as the write is confirmed.
  */
 async function runEnableClassIfAsked(): Promise<void> {
-  const want = (process.env.MERRYMEN_ENABLE_CLASS_FOR ?? "").trim().toLowerCase();
-  if (!want) return;
+  const target = fleetIdTarget("MERRYMEN_ENABLE_CLASS_FOR", process.env.MERRYMEN_ENABLE_CLASS_FOR);
+  if (!target) return;
   if (enableClassRan) return;
   enableClassRan = true;
 
-  if (!/^0x[0-9a-f]{40}$/.test(want)) {
-    log("enable-class: MERRYMEN_ENABLE_CLASS_FOR is not an address — refusing to guess");
+  if ("refused" in target) {
+    log(`enable-class: ${target.refused}`);
     return;
   }
+  const want = target.id;
   try {
     const { CANARY, DAVE_CLASS, classEnableBlockers, describeCanaryChange, mergeCanary } =
       await import("./enable-class");
@@ -8944,15 +9028,18 @@ async function runEnableClassIfAsked(): Promise<void> {
  * writes the whole blob, so a naive write erases every setting the owner chose.
  */
 async function runHaltClassEntriesIfAsked(): Promise<void> {
-  const want = (process.env.MERRYMEN_HALT_CLASS_ENTRIES_FOR ?? "").trim().toLowerCase();
-  if (!want) return;
+  const target = fleetIdTarget("MERRYMEN_HALT_CLASS_ENTRIES_FOR", process.env.MERRYMEN_HALT_CLASS_ENTRIES_FOR);
+  if (!target) return;
   if (haltClassEntriesRan) return;
   haltClassEntriesRan = true;
 
-  if (!/^0x[0-9a-f]{40}$/.test(want)) {
-    log("halt-entries: MERRYMEN_HALT_CLASS_ENTRIES_FOR is not an address — refusing to guess");
+  // A halt this build cannot write for a tenant it cannot name is said as
+  // such, never taken as done: nothing here touches any other tenant.
+  if ("refused" in target) {
+    log(`halt-entries: ${target.refused}; NOTHING WAS HALTED`);
     return;
   }
+  const want = target.id;
   try {
     const { HALT_ENTRIES, HALT_MUST_PRESERVE, mergeHaltEntries } = await import("./enable-class");
     const { getSettingsStore } = await import("./settings-store");
@@ -9035,12 +9122,13 @@ async function runCashRowRepairIfAsked(): Promise<void> {
     return;
   }
   const applying = mode === "apply";
-  const only = new Set(
-    (process.env.MERRYMEN_REPAIR_CLASS_CASH_ROW_ONLY ?? "")
-      .split(",")
-      .map((t) => t.trim().toLowerCase())
-      .filter((t) => t.startsWith("0x")),
-  );
+  // Read whole (fleet-id.ts), as the class-pnl repair's scope is.
+  const scope = fleetIdScope("MERRYMEN_REPAIR_CLASS_CASH_ROW_ONLY", process.env.MERRYMEN_REPAIR_CLASS_CASH_ROW_ONLY);
+  if ("refused" in scope) {
+    log(`class-cash-row: ${scope.refused}; nothing was done`);
+    return;
+  }
+  const only = new Set<string>(scope.ids);
   // NO FLEET APPLY. A tool that can delete rows for every owner at once is a
   // different and much larger thing to leave armed by accident.
   if (applying && only.size === 0) {
@@ -9124,15 +9212,16 @@ async function runCashRowRepairIfAsked(): Promise<void> {
 }
 
 async function runTenantInspectIfAsked(): Promise<void> {
-  const want = (process.env.MERRYMEN_INSPECT_TENANT ?? "").trim().toLowerCase();
-  if (!want) return;
+  const target = fleetIdTarget("MERRYMEN_INSPECT_TENANT", process.env.MERRYMEN_INSPECT_TENANT);
+  if (!target) return;
   if (tenantInspectRan) return;
   tenantInspectRan = true;
 
-  if (!/^0x[0-9a-f]{40}$/.test(want)) {
-    log(`inspect: MERRYMEN_INSPECT_TENANT is not an address — refusing to guess`);
+  if ("refused" in target) {
+    log(`inspect: ${target.refused}`);
     return;
   }
+  const want = target.id;
   const url = process.env.DATABASE_URL;
   if (!url) {
     log("inspect: asked for, but there is no DATABASE_URL");
@@ -10012,6 +10101,14 @@ async function runReceiptAttestationIfAsked(): Promise<void> {
 
 async function runReconstructionDryRunIfAsked(): Promise<void> {
   if ((process.env.MERRYMEN_ACCOUNTING_RECONSTRUCT ?? "").trim() !== "1") return;
+  // The repair's account scope, read whole before anything (fleet-id.ts). An
+  // entry that is not 0x used to be dropped, and alone left a scan, and a
+  // preview, of every account.
+  const accountScope = fleetIdScope("MERRYMEN_REPAIR_ACCOUNT", process.env.MERRYMEN_REPAIR_ACCOUNT);
+  if ("refused" in accountScope) {
+    log(`recon| ${accountScope.refused}; nothing was scanned or repaired`);
+    return;
+  }
   const url = process.env.DATABASE_URL;
   if (!url) {
     log("reconstruction dry run asked for, but there is no DATABASE_URL");
@@ -10127,12 +10224,7 @@ async function runReconstructionDryRunIfAsked(): Promise<void> {
     // about. The ROSTER still enumerates every tenant from the plan, so a
     // scoped run still reports 24/24 — the accounts outside the scope simply
     // carry no chain evidence and say so.
-    const scopeTo = new Set(
-      (process.env.MERRYMEN_REPAIR_ACCOUNT ?? "")
-        .split(",")
-        .map((a) => a.trim().toLowerCase())
-        .filter((a) => a.startsWith("0x")),
-    );
+    const scopeTo = new Set<string>(accountScope.ids);
     const allAccounts = agents.map((a) => String(a.smart_account)).filter((a) => a.startsWith("0x"));
     const accounts = scopeTo.size ? allAccounts.filter((a) => scopeTo.has(a.toLowerCase())) : allAccounts;
     if (scopeTo.size && accounts.length === 0) {
@@ -10242,6 +10334,15 @@ async function runReconstructionDryRunIfAsked(): Promise<void> {
 async function runRepairIfAsked(shared: Db, plans: readonly AccountPlan[]): Promise<void> {
   const opts = parseRepairOptions(process.env);
   if (!opts) return;
+  // parseRepairOptions keeps only the entries starting with 0x. One that is
+  // not 0x is refused here, whole, before the preview (fleet-id.ts): dropped,
+  // it would leave a commit short of an account somebody named, or alone, a
+  // preview of every account.
+  const named = fleetIdScope("MERRYMEN_REPAIR_ACCOUNT", process.env.MERRYMEN_REPAIR_ACCOUNT);
+  if ("refused" in named) {
+    log(`repair| refusing: ${named.refused}`);
+    return;
+  }
 
   // THE PREVIEW IS ALWAYS PRINTED, in every mode. An operator reading a commit
   // run's output should not have to go and find the dry run it corresponds to.
@@ -11612,12 +11713,23 @@ function attachFomoBroker(tenant: string, proc: ChildProcess): void {
 
 function noteFomoFailure(text: string): void {
   const now = Date.now();
-  // Never a tenant, never a URL with its key: the same scrub the pass uses for its own lines.
-  const clean = text.replace(/0x[0-9a-fA-F]{40}/g, "0x…").replace(/([?&](?:key|apikey|api_key)=)[^&\s]*/gi, "$1***").slice(0, 300);
+  const clean = fomoFailureText(text);
   if (!fomoLastFailure || fomoLastFailure.text !== clean || now - fomoLastFailure.at > 20 * 60_000) {
     fomoLastFailure = { text: clean, at: now };
     log(`fomo: ${clean}`);
   }
+}
+
+/**
+ * Never a tenant, never a URL with its key. redactUrls first (redact-urls.ts):
+ * a provider that keys its URL by path (Alchemy's /v2/<key>, Triton, Syndica)
+ * or by host keeps only scheme and host, so this line never relies on
+ * guardStdio alone if it is ever stored or sent elsewhere. Then the scrub the
+ * pass uses for its own lines (redactUrl), `api-key=` included, the name
+ * Solana RPCs such as Helius take a key under, for a key outside a URL.
+ */
+export function fomoFailureText(text: string): string {
+  return redactUrls(text).replace(/0x[0-9a-fA-F]{40}/g, "0x…").replace(/([?&](?:key|api[-_]?key)=)[^&\s]*/gi, "$1***").slice(0, 300);
 }
 
 /** Stop the stream and give up the fleet lease (FLEET_HALT, shutdown). The next pass after a halt builds a new one. */

@@ -60,6 +60,14 @@ const KEYED_HOSTS: readonly string[] = [
   "stackup.sh",
   "biconomy.io",
   "candide.dev",
+  // Solana RPC providers. Helius takes ?api-key= (removed on any host by name),
+  // but its dedicated and older endpoints too; Triton (rpcpool.com) and Syndica
+  // put a lower-case token in the path, which the shape test does not read as a
+  // key. Alchemy, QuickNode, Ankr and Chainstack are listed above.
+  "helius-rpc.com", // mainnet.helius-rpc.com/?api-key=<key>
+  "helius.xyz", // rpc.helius.xyz/?api-key=<key>
+  "rpcpool.com", // <name>.mainnet.rpcpool.com/<token>
+  "syndica.io", // solana-mainnet.api.syndica.io/api-key/<key>
 ];
 
 /**

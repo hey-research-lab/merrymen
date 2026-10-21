@@ -203,10 +203,10 @@ describe("grant.json changes only after the archive — and a kill without one d
     before_(remove, "const kept = await archiveCurrentGrant();", "await rm(homePaths.grant(), { force: true });", "archive first");
     before_(remove, 'if (kept.kind === "failed") throw new GrantArchiveError(kept.why, pauseForKeptGrant());', "await rm(homePaths.grant()", "refuse and pause before deleting");
     before_(remove, "await rm(homePaths.grant(), { force: true });", "liftKillPause();", "lift only a kill's pause after removal");
-    for (const route of [ROUTE, DISCARD]) {
-      assert.match(route, /removeSelfHostedGrant/);
-      assert.match(route, /if \(e instanceof GrantArchiveError\) return NextResponse\.json\(\{ error: e\.message, paused: e\.paused \}, \{ status: 409 \}\);/);
-    }
+    for (const route of [ROUTE, DISCARD]) assert.match(route, /removeSelfHostedGrant/);
+    assert.match(DISCARD, /if \(e instanceof GrantArchiveError\) return NextResponse\.json\(\{ error: e\.message, paused: e\.paused \}, \{ status: 409 \}\);/);
+    // The kill switch says whether it stopped the local Solana strategy too, which it does first.
+    assert.match(ROUTE, /if \(e instanceof GrantArchiveError\) \{\s*return NextResponse\.json\(\{ error: `\$\{e\.message\}[^`]*`,\s*paused: e\.paused, solana: solana \? "stopped" : "not-stopped" \}, \{ status: 409 \}\);/);
   });
 
   it("the worker's Telegram /kill: archive, then remove the SAME file; a failed archive pauses and returns first", () => {

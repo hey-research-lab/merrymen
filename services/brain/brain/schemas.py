@@ -13,7 +13,8 @@ THREE RULES THIS FILE ENFORCES, none of them stylistic:
      TypeScript resolves those to a canonical allowlisted address. A model that
      can emit an 0x… string can emit one nobody allowlisted, and it would travel
      toward the executor. The validator below rejects the shape outright rather
-     than trusting a prompt to have discouraged it.
+     than trusting a prompt to have discouraged it, and the base58 shapes of a
+     Solana key or signature with it (onchain_ids.py).
   2. NO FLOATING-POINT MONEY. Sizes cross the service boundary as integer
      micro-USDG. A JSON float is not a quantity of money.
   3. EVERY DECISION CARRIES ITS COST. Not as telemetry bolted on afterwards —
@@ -27,6 +28,8 @@ import re
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationInfo, field_validator, model_validator
+
+from .onchain_ids import onchain_ids_in
 
 SCHEMA_VERSION = "1.0.0"
 
@@ -135,6 +138,9 @@ def _reject_executable(text: str, field: str) -> str:
     Applied to every free-text field a model writes, because the thesis is
     PUBLISHED and the evidence is PERSISTED — an address that reaches either has
     escaped the boundary just as surely as one in a size field.
+
+    The worker re-checks the same shapes on arrival (worker/src/brain-client.ts),
+    with the shared detector in packages/core/src/ids.ts.
     """
     if _ADDRESS.search(text):
         raise ValueError(
@@ -143,6 +149,21 @@ def _reject_executable(text: str, field: str) -> str:
         )
     if _HEXBLOB.search(text):
         raise ValueError(f"{field} contains a hex blob that could be calldata")
+    # SOLANA IDS ARE BASE58, which the two patterns above never see. Checked
+    # after them, so a text they refuse is refused in the same words as before.
+    # The glued scan (audit regressions F3): "CA<mint>" or "<mint>is" is an id
+    # too, as the worker's re-check reads it.
+    for hit in onchain_ids_in(text, glued=True):
+        if hit.family != "solana":
+            continue
+        if hit.shape == "address":
+            raise ValueError(
+                f"{field} contains a Solana address-shaped string. Brain names instruments, "
+                f"never addresses — trusted code resolves instrument_id to an address."
+            )
+        if hit.shape == "hash":
+            raise ValueError(f"{field} contains a Solana signature- or key-shaped string")
+        raise ValueError(f"{field} contains a Solana explorer link")
     return text
 
 

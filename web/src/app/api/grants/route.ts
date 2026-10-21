@@ -20,6 +20,7 @@ import {
   derivationUnreachable,
   duplicateWallPermissions,
   isHostedMode,
+  isRobinhoodChainId,
   type Derivation,
   type EnergyStatus,
   type StoredGrant,
@@ -35,6 +36,7 @@ import { getSettingsStore } from "@merrymen/settings-store";
 import { ledgerHasAgent, mintAndNameAgent } from "@/lib/first-name";
 import { deriveKernelAccountAddress } from "@/lib/derive-account";
 import { archiveCurrentGrant, GrantArchiveError, removeSelfHostedGrant } from "@/lib/grant-archive";
+import { stopLocalSolanaForKill, stopSolanaForKill } from "../../../../../worker/src/solana-kill";
 import { readFleetRecoveryView, type FleetRecoveryView } from "../../../../../worker/src/fleet-recovery";
 import { resolveConfig } from "../../../../../worker/src/settings";
 import { errorText } from "../../../../../worker/src/redact-urls";
@@ -47,6 +49,46 @@ const HEARTBEAT_FILE = homePaths.heartbeat();
 /** A well-formed 0x EVM address. The archive (lib/grant-archive.ts) keeps its own
  * copy of this check, since it builds a filename from the address. */
 const isAddr = (v: unknown): v is `0x${string}` => typeof v === "string" && /^0x[0-9a-fA-F]{40}$/.test(v);
+
+/**
+ * BODY LIMITS. A grant is a serialized permission plus a few fields; partner
+ * activation (lib/partner-enrollment.ts) carries the same grant in at most
+ * 256 KiB, with the permission itself capped at 240,000 characters. Nothing a
+ * signer makes comes close. The kill switch's body is a few named fields.
+ * Every check below parses or scans the whole payload, so it is bounded first.
+ */
+const GRANT_BODY_MAX_BYTES = 256 * 1024;
+const GRANT_DELETE_BODY_MAX_BYTES = 8 * 1024;
+
+/**
+ * The body as text, or null when it is larger than `limit` bytes. Counted
+ * while it streams, so an oversized body is never held in memory whole; the
+ * declared length is refused first as the cheap case.
+ */
+async function readGrantBody(req: Request, limit: number): Promise<string | null> {
+  const declared = req.headers.get("content-length");
+  if (declared !== null && !(Number(declared) <= limit)) return null;
+  if (!req.body) return "";
+  const reader = req.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let size = 0;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      size += value.byteLength;
+      if (size > limit) {
+        await reader.cancel().catch(() => undefined);
+        return null;
+      }
+      chunks.push(value);
+    }
+  } finally {
+    reader.releaseLock();
+  }
+  return Buffer.concat(chunks, size).toString("utf8");
+}
+const tooLarge = () => NextResponse.json({ error: "That request is too large. Nothing was saved." }, { status: 413 });
 
 export interface AgentStatus {
   exists: boolean;
@@ -129,7 +171,13 @@ export interface AgentStatus {
 }
 
 export async function POST(req: Request) {
-  const grant = (await req.json()) as StoredGrant;
+  let text: string | null;
+  try { text = await readGrantBody(req, GRANT_BODY_MAX_BYTES); }
+  catch { return NextResponse.json({ error: "not a grant" }, { status: 400 }); }
+  if (text === null) return tooLarge();
+  let grant: StoredGrant;
+  try { grant = JSON.parse(text) as StoredGrant; }
+  catch { return NextResponse.json({ error: "not a grant" }, { status: 400 }); }
   if (!grant?.serialized || !isAddr(grant?.smartAccount)) {
     return NextResponse.json({ error: "not a grant" }, { status: 400 });
   }
@@ -162,6 +210,26 @@ export async function POST(req: Request) {
           "install it — the agent would be unable to make any trade at all. It usually means the page was " +
           "open from before an update: reload and sign again.",
         duplicates,
+      },
+      { status: 400 },
+    );
+  }
+
+  // ── A GRANT FOR A CHAIN THIS PRODUCT DOES NOT RUN ON ─────────────────────
+  //
+  // Nothing checked chainId before, and what reads it downstream (chainForId,
+  // the derivation, the balance reads) turns any id but the testnet into
+  // mainnet: a grant naming chain 1, a Solana grant or one with no chainId at
+  // all was accepted and read as Robinhood Chain. Every grant our signers make
+  // carries 4663 or 46630 (chain.id), so this refuses only what they never
+  // send. For every mode, before the hosted checks read the id, and pure, so
+  // it burns no nonce.
+  if (!isRobinhoodChainId(grant.chainId)) {
+    const named = grant.chainId === undefined ? "names no chain" : `is for chain ${JSON.stringify(grant.chainId).slice(0, 64)}`;
+    return NextResponse.json(
+      {
+        error: `this grant ${named}, and Merrymen only runs on Robinhood Chain (4663) and its testnet (46630). Nothing was saved.`,
+        code: "unsupported_chain",
       },
       { status: 400 },
     );
@@ -466,7 +534,10 @@ export async function DELETE(req: Request) {
     const tenant = tenantOf(req);
     if (!tenant) return NextResponse.json({ error: "not signed in" }, { status: 401 });
     // A tab can switch logins while the owner's stop request is in flight.
-    const body = await req.json().catch(() => null) as { expectedTenant?: unknown; purpose?: unknown; expectedAccount?: unknown; expectedSession?: unknown } | null;
+    const text = await readGrantBody(req, GRANT_DELETE_BODY_MAX_BYTES).catch(() => "");
+    if (text === null) return NextResponse.json({ error: "That request is too large. Nothing was deleted." }, { status: 413 });
+    let body: { expectedTenant?: unknown; purpose?: unknown; expectedAccount?: unknown; expectedSession?: unknown } | null;
+    try { body = JSON.parse(text) as typeof body; } catch { body = null; }
     if (body?.expectedTenant !== undefined &&
         (typeof body.expectedTenant !== "string" || body.expectedTenant.toLowerCase() !== tenant.toLowerCase())) {
       return NextResponse.json({ error: "The signed-in account changed. Check the account before stopping it." }, { status: 409 });
@@ -488,16 +559,45 @@ export async function DELETE(req: Request) {
         return NextResponse.json({ error: "The service could not confirm the replacement stop. Your wallet was kept; try again.", ownerFacing: true }, { status: 503 });
       }
     }
-    await getGrantStore().remove(tenant);
-    return NextResponse.json({ ok: true });
+    // The Solana strategy is stopped whatever happens to the Robinhood grant: a store that throws
+    // here still leaves the owner's autonomous Solana trading off.
+    let removal: unknown = null;
+    try { await getGrantStore().remove(tenant); } catch (e) { removal = e ?? new Error("grant removal failed"); }
+    const solana = await solanaStopped(() => stopSolanaForKill(tenant));
+    if (removal !== null) throw removal;
+    return solanaKilled(solana);
   }
   // The kill switch destroys the session key, NOT the wallet — archived first.
   // The web's Start over removes it the same way, from /api/grants/discard.
+  // The local Solana strategy is stopped first, whatever happens to the Robinhood grant: an
+  // archive it cannot write keeps grant.json (and pauses trading instead), and must never
+  // leave autonomous Solana trading running behind a "paused" answer.
+  const solana = await solanaStopped(() => stopLocalSolanaForKill());
   try {
     await removeSelfHostedGrant();
   } catch (e) {
-    if (e instanceof GrantArchiveError) return NextResponse.json({ error: e.message, paused: e.paused }, { status: 409 });
+    if (e instanceof GrantArchiveError) {
+      return NextResponse.json({ error: `${e.message}${solana ? " Your Solana strategy was stopped." : " Your Solana strategy could not be stopped either: try the kill again."}`,
+        paused: e.paused, solana: solana ? "stopped" : "not-stopped" }, { status: 409 });
+    }
     throw e;
+  }
+  return solanaKilled(solana);
+}
+
+/**
+ * "Kill all agents" stops autonomous Solana trading too: the strategy is turned
+ * off with a revision bump that fences any admission already in flight. True
+ * when it is off (or there was none), false when it could not be stopped.
+ */
+async function solanaStopped(stop: () => Promise<unknown>): Promise<boolean> {
+  try { await stop(); return true; } catch { return false; }
+}
+/** A kill that could not stop the Solana strategy is reported incomplete, never as done. A retry is safe. */
+function solanaKilled(stopped: boolean): NextResponse {
+  if (!stopped) {
+    return NextResponse.json({ error: "Kill incomplete: your Robinhood Chain agent is stopped, but your Solana strategy could not be stopped yet. Try the kill again.",
+      ownerFacing: true, solana: "not-stopped" }, { status: 503 });
   }
   return NextResponse.json({ ok: true });
 }

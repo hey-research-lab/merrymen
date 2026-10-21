@@ -22,13 +22,14 @@
  */
 
 import { existsSync, rmSync, writeFileSync } from "node:fs";
+import path from "node:path";
 // RELATIVE import only — the "@merrymen/core" alias exists solely in dev
 // tsconfigs; inside the installed package tsx can't resolve it and the worker
 // dies at startup (which silently kills Telegram). Never alias-import in worker/.
 import { PC_CAPABILITIES, PROPOSAL_PARAM, isHostedMode, parseTailRequest, saysTail, tailAsksToTake } from "../../../packages/core/src/index";
 import { patchSettingsFile, type ResolvedConfig } from "../settings";
 import { rememberChatSetting } from "./state";
-import { ensureHome, homePaths } from "../home";
+import { ensureHome, homePaths, merrymenHome } from "../home";
 import { loadGrantFile } from "../grant";
 import {
   answerCallbackQuery,
@@ -49,7 +50,7 @@ import {
   type TgCallback,
   type TgMessage,
 } from "./api";
-import { runAgentTask } from "./agent";
+import { runAgentTask, solanaSecretValues } from "./agent";
 import { SETTING_CONFIRM_TTL_SEC, TAIL_CONFIRM_TTL_SEC, executeCommand, type CommandDeps, type KillResult, type PendingAction } from "./executor";
 import {
   appliedManyText,
@@ -80,7 +81,8 @@ import { canConsider, considerRefusedNote, parseTailCallback, tailAmbiguousText,
 import type { ExtendTailData, UntailData } from "../fomo/tools";
 import { TAIL_CAP_SPENT_LINE } from "../fomo/tail-notices";
 import { resolveLlm } from "../llm";
-import { CONTROL_KINDS, PC_KINDS, TAIL_USAGE, interpretWithLlm, narrateChat, narrateWhy, parseSlash, stripThinkingBlock, type Command } from "./interpreter";
+import { CONTROL_KINDS, PC_KINDS, TAIL_USAGE, interpretWithLlm, narrateChat, parseSlash, stripThinkingBlock, type Command } from "./interpreter";
+import { whyAnswer } from "./why-answer";
 import { makePcActions, resolveInRoot } from "./pc";
 import { transcribeVoice } from "./voice";
 import { fmtReminders, fmtWatchers, parseWatchSpec, parseWhenSec } from "./watchers";
@@ -95,7 +97,6 @@ import {
   readTrades,
   readWallet,
   readWhyEvidence,
-  redactAddresses,
   dashboardBase,
   type StatusContext,
 } from "./reads";
@@ -187,7 +188,7 @@ export interface TelegramServiceDeps {
   /** Build a bounded transfer intent and route it through processIntent. */
   submitTransfer: (to: `0x${string}`, usdg: number) => Promise<string>;
   /** Delete the grant (kill switch). */
-  kill: () => KillResult;
+  kill: () => KillResult | Promise<KillResult>;
   /** Mirror a /name change into the agents table (dashboard display). */
   onNameChange?: (name: string) => void;
   /**
@@ -1363,18 +1364,8 @@ export function startTelegram(deps: TelegramServiceDeps): { stop: () => void } {
         // followed at all, and "fund your agent" is the commonest thing anyone
         // is ever told to do.
         wallet: () => readWallet(statusCtx().agentId),
-        why: async () => {
-          const ev = readWhyEvidence(statusCtx().agentId);
-          const llm = resolveLlm(cfg);
-          if (!ev.hasTrade || !llm) return ev.text;
-          // Model text, sent as HTML: escaped, or a "<" in it (or in a
-          // decision's reason it quotes) makes Telegram refuse the message.
-          // Addresses redacted: the evidence quotes event lines (reads.ts).
-          const plain = redactAddresses(
-            ev.text.replace(/<[^>]+>/g, "").replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&amp;/g, "&"),
-          );
-          return escModel(await narrateWhy(plain, llm));
-        },
+        // The model reads redacted evidence; the owner keeps the tx hash (why-answer.ts).
+        why: () => whyAnswer(readWhyEvidence(statusCtx().agentId), resolveLlm(cfg)),
         settings: () => settingsListText(cfg as unknown as Record<string, unknown>),
       },
       // ── settings by text: ask first, change on confirm ────────────────────
@@ -1503,8 +1494,8 @@ export function startTelegram(deps: TelegramServiceDeps): { stop: () => void } {
         setPaused(paused);
         deps.note("warn", `Telegram: ${paused ? "paused" : "resumed"} by chat ${msg.chatId}`);
       },
-      kill: () => {
-        const r = deps.kill();
+      kill: async () => {
+        const r = await deps.kill();
         if (r.ok) deps.note("warn", `Telegram: KILL by chat ${msg.chatId}`);
         // Refused on purpose, and still worth a record of who asked.
         else if (r.archiveFailed) deps.note("warn", `Telegram: KILL by chat ${msg.chatId} kept the grant (${r.archiveFailed.why}) and paused instead`);
@@ -1779,6 +1770,8 @@ export function startTelegram(deps: TelegramServiceDeps): { stop: () => void } {
         grant?.serialized,
         grant?.demoOwnerPrivateKey,
         grant?.demoSessionPrivateKey,
+        // Solana's server secrets, from the environment and a self-hosted .env.solana.local.
+        ...solanaSecretValues(process.env, [path.join(process.cwd(), ".env.solana.local"), path.join(merrymenHome(), ".env.solana.local")]),
       ].filter((s): s is string => typeof s === "string" && s.length >= 8);
       const stopFlag = { stopped: false };
       agentRuns.set(msg.chatId, stopFlag);

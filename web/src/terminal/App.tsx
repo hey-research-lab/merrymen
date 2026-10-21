@@ -52,6 +52,8 @@ import { Home } from "./screens/Home";
 import { CreateAgent } from "./screens/CreateAgent";
 import Settings from "./screens/Settings";
 import Wallet from "./screens/Wallet";
+import dynamic from "next/dynamic";
+import "./SolanaNavigation.css";
 
 import { Profile } from "./screens/Profile";
 import { glanceOfHow, thesisOfHow, type ProfileAgent } from "./profile-view";
@@ -85,6 +87,7 @@ import { goTo } from "./navigate";
 import { TickerStrip } from "@/components/shell/Ticker";
 import "./live-motion.css";
 
+const SolanaScreen = dynamic(() => import("./SolanaScreen").then((module) => module.SolanaScreen));
 
 const desktopSnapshot = () => window.matchMedia("(min-width: 1100px)").matches;
 function subscribeDesktop(onChange: () => void) {
@@ -93,7 +96,7 @@ function subscribeDesktop(onChange: () => void) {
   return () => media.removeEventListener("change", onChange);
 }
 
-export function App() {
+export function App({ solana = false }: { solana?: boolean }) {
   const bodyRef = useRef<HTMLDivElement>(null);
   /**
    * THE LATEST ANSWER OF EVERY READ, and the screens drawn from them.
@@ -106,7 +109,7 @@ export function App() {
   const [sources, setSources] = useState<LiveSources>(seedSources);
   const live = useMemo(() => liveOf(sources), [sources]);
   const pathname = usePathname() ?? "/";
-  const requestedScreen = useMemo(()=>screenForPath(pathname),[pathname]);
+  const requestedScreen = useMemo(()=>screenForPath(pathname, solana),[pathname, solana]);
   // In place, never a round trip — see navigate.ts.
   const setScreen = (next: Screen) => goTo(pathForScreen(next));
   const [account, setAccount] = useState<AccountState|null>(null);
@@ -530,7 +533,7 @@ export function App() {
           header and the desktop rail — and with them a second `AccountEntry`,
           which polls and fetches like the visible one. Display:none hides a
           component; it does not stop it running. */}
-      {desktop && <DesktopHeader hasAgent={!!mine} mine={displayMine} onScreen={openScreen} onTab={goTab} />}
+      {desktop && <DesktopHeader hasAgent={!!mine} hideBalances={screen.kind === "solana"} mine={displayMine} onScreen={openScreen} onTab={goTab} />}
       {desktop && (
         <DesktopSidebar
           reads={live.reads}
@@ -557,6 +560,7 @@ export function App() {
             visitor, signed in or not. It takes no props on purpose: it reads
             nothing of the account, and nothing here reads it. */}
         <ServiceNotice />
+        {solana && <nav aria-label="Trading networks" className="solana-network-nav"><a href="/home" aria-current={screen.kind !== "solana" ? "page" : undefined}>Robinhood Chain</a><a href="/solana" aria-current={screen.kind === "solana" ? "page" : undefined}>Solana</a></nav>}
         {/* THE ONE PROMPT THAT FIRES BEFORE THE FIRST REFUSAL, rather than
             after it. Every other re-sign surface answers a question the
             WORKER asked — expired, uncovered, dead policy — and none of them
@@ -564,7 +568,7 @@ export function App() {
             it is true on every screen, and handed `exists` straight from the
             server so it cannot flash for an owner whose account is still
             loading. It navigates to the one signing control; it never signs. */}
-        {!recovery && <ResignPrompt
+        {!recovery && screen.kind !== "solana" && <ResignPrompt
           exists={account ? account.status.exists : null}
           grantedAt={account?.status.grant?.grantedAt ?? null}
           tenant={account?.session.hosted ? account.session.address : null}
@@ -582,7 +586,8 @@ export function App() {
             openScreen(next);
           } else openScreen(next);
         }} onExplore={section => { if (desktop) setSidebarSection(section); }} onQuestion={()=>{setChatDraft(current => current || "Explain my strategy and trading limits. Am I using paper or live trading?");goTab("agent");}}/>
-        {!mine && !desktop && screen.kind !== "create" && screen.kind !== "groupchat" && <AccountEntry account={account} accountFailed={accountFailed} portfolio={portfolioRead} retrying={accountBusy} onRefresh={refreshAccount} onSignedIn={invalidateOwnerView}/>}
+        {!mine && !desktop && screen.kind !== "create" && screen.kind !== "groupchat" && screen.kind !== "solana" && <AccountEntry account={account} accountFailed={accountFailed} portfolio={portfolioRead} retrying={accountBusy} onRefresh={refreshAccount} onSignedIn={invalidateOwnerView}/>}
+        {screen.kind === "solana" && <SolanaScreen key={epoch}/>}
         {screen.kind === "create" && <CreateAgent account={account} accountFailed={accountFailed} retrying={accountBusy} onRefresh={refreshAccount} onSignedIn={invalidateOwnerView} onBack={()=>goTab("home")} onDone={()=>{refreshAccount();goTab("agent");}} onFund={grant=>{setAccount(current=>current?{...current,status:{...current.status,exists:true,grant}}:current);openScreen({kind:"deposit"});}}/>}
         {screen.kind === "settings" && <Settings onFund={()=>openScreen({kind:"deposit"})} slug={mine?.slug ?? null} onSaved={chat.refreshSettings} agentDown={agentDown}/>}
         {screen.kind === "grant" && <Wallet key={epoch}/>}
@@ -803,7 +808,7 @@ export function App() {
         )}
         {screen.kind === "groupchat" && <GroupChat mySlug={mine?.slug ?? null} onProfile={(slug) => openScreen({ kind: "profile", slug })} onToken={(id) => openScreen({ kind: "token", id })} />}
       </div>
-      {desktop && money ? (
+      {desktop && screen.kind === "solana" ? <aside className="desktop-portfolio"><section className="hosted-entry"><h2>Solana account</h2><p>Solana balances, permissions and trading limits are shown in this workspace.</p><p>Use the network selector to return to Robinhood Chain.</p></section></aside> : desktop && money ? (
         <aside
           className="desktop-money-panel"
           aria-label={money === "withdraw" ? "Withdraw funds" : "Add funds"}

@@ -21,6 +21,9 @@ const removed: string[] = [];
 const replacements: unknown[][] = [];
 let replacementState: "stopped" | "absent" | "changed" = "stopped";
 let replacementError = false;
+const solanaStopped: string[] = [];
+let solanaDown = false;
+let removeDown = false;
 
 before(async () => {
   home = mkdtempSync(path.join(tmpdir(), "mm-grant-tenant-"));
@@ -37,11 +40,16 @@ before(async () => {
     asked.push(tenant);
     return null;
   });
-  mock.method(grants.getGrantStore(), "remove", async (tenant: string) => { removed.push(tenant); });
+  mock.method(grants.getGrantStore(), "remove", async (tenant: string) => { if (removeDown) throw new Error("database unavailable"); removed.push(tenant); });
   mock.method(grants.getGrantStore(), "stopForReplacement", async (...args: unknown[]) => {
     replacements.push(args);
     if (replacementError) throw new Error("database unavailable");
     return replacementState;
+  });
+  const solana = await import("@/lib/solana-binding-store");
+  mock.method(solana.getSolanaBindingStore(), "disableForKill", async (tenant: string) => {
+    if (solanaDown) throw new Error("database unavailable");
+    solanaStopped.push(tenant); return true;
   });
   ({ GET, DELETE } = await import("./route"));
 });
@@ -54,7 +62,7 @@ after(() => {
   }
   rmSync(home, { recursive: true, force: true });
 });
-beforeEach(() => { asked.length = 0; removed.length = 0; replacements.length = 0; replacementState = "stopped"; replacementError = false; });
+beforeEach(() => { asked.length = 0; removed.length = 0; replacements.length = 0; replacementState = "stopped"; replacementError = false; solanaStopped.length = 0; solanaDown = false; removeDown = false; });
 
 it("binds an empty hosted grant response to the tenant authenticated by the cookie", async () => {
   for (const tenant of [A, B]) {
@@ -85,6 +93,32 @@ it("a stop cannot remove a different tenant after a login switches", async () =>
   }
   assert.equal((await DELETE(request(B))).status, 200);
   assert.deepEqual(removed, [B]);
+  assert.deepEqual(solanaStopped, [B], "kill all agents stops the same tenant's Solana strategy");
+});
+
+it("kill all agents stops the Solana strategy even when the Robinhood grant cannot be removed", async () => {
+  const request = new Request(`${ORIGIN}/api/grants`, {
+    method: "DELETE", headers: { cookie: `${auth.SESSION_COOKIE}=${auth.mintSession(A)}`, "content-type": "application/json" },
+    body: JSON.stringify({ expectedTenant: A, purpose: "delete-agent" }),
+  });
+  removeDown = true;
+  await assert.rejects(DELETE(request), /database unavailable/, "the Robinhood failure is still an error");
+  assert.deepEqual(removed, []); assert.deepEqual(solanaStopped, [A], "but the Solana strategy is off");
+});
+
+it("kill all agents is reported incomplete, never done, while the Solana strategy could not be stopped", async () => {
+  const request = () => new Request(`${ORIGIN}/api/grants`, {
+    method: "DELETE", headers: { cookie: `${auth.SESSION_COOKIE}=${auth.mintSession(A)}`, "content-type": "application/json" },
+    body: JSON.stringify({ expectedTenant: A, purpose: "delete-agent" }),
+  });
+  solanaDown = true;
+  const failed = await DELETE(request());
+  assert.equal(failed.status, 503);
+  const body = await failed.json() as { error: string; ownerFacing: boolean; ok?: boolean };
+  assert.match(body.error, /Kill incomplete/); assert.equal(body.ownerFacing, true); assert.equal(body.ok, undefined);
+  solanaDown = false;
+  assert.equal((await DELETE(request())).status, 200, "the retry finishes it");
+  assert.deepEqual(removed, [A, A]); assert.deepEqual(solanaStopped, [A]);
 });
 
 const replacementRequest = (body: unknown, tenant: string | null = A) => new Request(`${ORIGIN}/api/grants`, {
@@ -99,6 +133,19 @@ it("permission replacement uses the authenticated tenant and retains the destruc
   assert.deepEqual(await response.json(), { ok: true, replacement: true, state: "stopped" });
   assert.deepEqual(replacements, [[A, B, A]]);
   assert.deepEqual(removed, []);
+});
+
+it("an oversized stop body is refused with 413 before it is parsed, and nothing is stopped or removed", async () => {
+  const big = { expectedTenant: A, purpose: "delete-agent", pad: "x".repeat(8 * 1024) };
+  const response = await DELETE(replacementRequest(big));
+  assert.equal(response.status, 413);
+  assert.match(((await response.json()) as { error: string }).error, /too large\. Nothing was deleted/);
+  assert.deepEqual(removed, []); assert.deepEqual(replacements, []); assert.deepEqual(solanaStopped, []);
+  // Just under the limit is an ordinary stop.
+  const fits = { expectedTenant: A, purpose: "delete-agent", pad: "" };
+  fits.pad = "x".repeat(8 * 1024 - JSON.stringify(fits).length);
+  assert.equal((await DELETE(replacementRequest(fits))).status, 200);
+  assert.deepEqual(removed, [A]);
 });
 
 it("a legacy open renewal tab's bare DELETE cannot erase its agent or group approvals", async () => {

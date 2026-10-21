@@ -1,4 +1,8 @@
 export * from "./chain";
+export * from "./ids";
+// NOT ./solana or ./solana-live. The phone bundles this barrel through Metro
+// (mobile/metro.config.js), which does not tree-shake, and an EAS build has no
+// @solana/kit; the worker and web import those two files by path.
 export * from "./settings";
 export * from "./llm-providers";
 export * from "./tokens";

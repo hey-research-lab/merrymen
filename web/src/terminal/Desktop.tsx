@@ -56,9 +56,10 @@ type Actions = {
 export function DesktopHeader({
   mine,
   hasAgent = true,
+  hideBalances = false,
   onScreen,
   onTab,
-}: Actions & { hasAgent?: boolean; mine: LiveMine }) {
+}: Actions & { hasAgent?: boolean; hideBalances?: boolean; mine: LiveMine }) {
   const displayedAutonomy = recoveryAutonomy(mine.autonomy, mine.recovery);
   const accountMenu = useRef<HTMLDetailsElement>(null);
   // "/" OPENS SEARCH, as the hint beside the word says (desktop.css). Only
@@ -108,16 +109,16 @@ export function DesktopHeader({
         {/* THE LABEL CARRIES THE TRUTH, not a caption under it. Someone who has
             already read "$964" as their deposit does not go on to read a
             footnote. See packages/core/src/autonomy.ts. */}
-        <span className={mine.autonomy.simulated ? "is-simulated" : undefined}>
+        {!hideBalances && <span className={mine.autonomy.simulated ? "is-simulated" : undefined}>
           <small>{displayedAutonomy.moneyLabel}</small>
           <strong>{money(mine.glance.cashUsd ?? null)}</strong>
-        </span>
-        <button
+        </span>}
+        {!hideBalances && <button
           className="desktop-fund"
           onClick={() => onScreen({ kind: "deposit" })}
         >
           {hasAgent ? "Add funds" : "Your account"}
-        </button>
+        </button>}
         <details className="desktop-account-menu" ref={accountMenu} onBlur={event=>{if(!event.currentTarget.contains(event.relatedTarget as Node|null))closeAccountMenu();}} onKeyDown={event=>{if(event.key==="Escape"){closeAccountMenu();accountMenu.current?.querySelector("summary")?.focus();}}}>
           <summary><Face name={mine.name} slug={mine.slug}/><span>{hasAgent && mine.name ? mine.name : "Account"}</span><ChevronDown size={14}/></summary>
           <nav aria-label="Account navigation" onClick={closeAccountMenu}>

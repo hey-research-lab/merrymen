@@ -1,5 +1,5 @@
 #!/bin/sh
-# The hosted image's start step: ONE image, THREE roles, picked per Railway
+# The hosted image's start step: ONE image, FOUR roles, picked per Railway
 # service by MERRYMEN_START. The Dockerfile runs it as
 #
 #   /usr/bin/tini -- /bin/sh /app/scripts/container-start.sh
@@ -98,6 +98,11 @@ case $role in
     guard
     exec node --import tsx worker/src/recovery-replies.ts
     ;;
+  start:solana)
+    started
+    guard
+    exec node --env-file-if-exists=.env.solana.local --import tsx worker/src/solana-agent-cli.ts
+    ;;
   *)
     # 64 is EX_USAGE: the configuration is wrong, not the code. Nothing has
     # started, so nothing needs stopping; Railway's ON_FAILURE policy retries a
@@ -105,9 +110,9 @@ case $role in
     # loud failure instead of the wrong role running green. The value itself is
     # not printed: it is whatever was pasted into the variable.
     if [ -z "$role" ]; then
-      echo "[start] refused: MERRYMEN_START is set but empty — delete it for the web role, or name one of: start:web start:orchestrator start:recovery-replies" >&2
+      echo "[start] refused: MERRYMEN_START is set but empty — delete it for the web role, or name one of: start:web start:orchestrator start:recovery-replies start:solana" >&2
     else
-      echo "[start] refused: MERRYMEN_START is not one of: start:web start:orchestrator start:recovery-replies" >&2
+      echo "[start] refused: MERRYMEN_START is not one of: start:web start:orchestrator start:recovery-replies start:solana" >&2
     fi
     exit 64
     ;;

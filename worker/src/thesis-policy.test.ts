@@ -17,6 +17,7 @@ import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { DatabaseSync } from "node:sqlite";
 
+import { base58Encode, SOLANA_USDG_MINT } from "../../packages/core/src/ids";
 import { wrapSqlite } from "./db";
 import { readPeerTheses } from "./peer-theses";
 import {
@@ -172,5 +173,68 @@ describe("a peer's landed trade is not buried under refusals the gate drops", ()
     } finally {
       raw.close();
     }
+  });
+});
+
+describe("the address backstop knows Solana ids (Solana P0)", () => {
+  const SIG = base58Encode(Uint8Array.from({ length: 64 }, (_, i) => (i * 37 + 11) & 0xff));
+  const IDS = [SOLANA_USDG_MINT, SIG, `https://solscan.io/token/${SOLANA_USDG_MINT}`];
+  const row = (over: Partial<ThesisRow> = {}): ThesisRow => ({
+    name: "Shogun",
+    slug: "0123456789abcdef",
+    source: "class-route",
+    action: "buy",
+    symbol: "MOON",
+    size_usdg: 5,
+    reason: "taking 5.00 USDG of MOON — early on the curve",
+    status: "landed",
+    said: 1,
+    last_at: 1_700_000_000,
+    first_at: 1_700_000_000,
+    mode: "live",
+    ...over,
+  });
+  const post = "Buyer breadth narrowed while depth held; broader buying would improve my view.";
+
+  it("drops the row wherever a 0x address drops it", () => {
+    assert.ok(publishableThesis(row()), "the fixture must publish");
+    for (const id of IDS) {
+      assert.equal(publishableThesis(row({ source: "strategist", reason: `rotating into ${id}` })), null, id);
+      assert.equal(publishableThesis(row({ name: id })), null, id);
+      assert.equal(publishableThesis(row({ x_handle: id })), null, id);
+    }
+    // A ticker cannot hold one (symbol is shown as given): the same drop.
+    assert.equal(publishableThesis(row({ symbol: SOLANA_USDG_MINT })), null);
+  });
+
+  it("costs a post its voice, not the trade, exactly as a 0x one does", () => {
+    for (const id of [`0x${"ab".repeat(20)}`, ...IDS]) {
+      const t = publishableThesis(row({ reason: null, post: `${post} ${id}` }));
+      assert.equal(t, null, `${id}: a post was all it had`);
+      const kept = publishableThesis(row({ post: `${post} ${id}` }))!;
+      assert.ok(kept, id);
+      assert.equal(kept.post, null, id);
+      assert.match(kept.reason!, /early on the curve/);
+    }
+    assert.equal(publishableThesis(row({ reason: null, post }))!.post, post);
+  });
+
+  it("knows a Solana id glued to the words around it (audit regressions F3)", () => {
+    const letters = "EEuxbXvdXfvgGiFWKYyEksxzabPKjwhYTNvGXFitaqqT";
+    const glued = [`CA${SOLANA_USDG_MINT}`, `ca${letters}`, `${letters}is the one`, `tx${SIG}done`, `${SOLANA_USDG_MINT}l`];
+    for (const id of glued) {
+      // A glued mint costs the post, and a post was all this row had.
+      assert.equal(publishableThesis(row({ reason: null, post: `${post} ${id}` })), null, id);
+      const kept = publishableThesis(row({ post: `${post} ${id}` }))!;
+      assert.ok(kept, id);
+      assert.equal(kept.post, null, id);
+      assert.match(kept.reason!, /early on the curve/);
+      // The final backstop drops the row wherever it sits.
+      assert.equal(publishableThesis(row({ source: "strategist", reason: `rotating into ${id}` })), null, id);
+      assert.equal(publishableThesis(row({ name: `${id}` })), null, id);
+    }
+    // Prose, tickers, URLs and a short hashtag still publish.
+    const plain = `${post} $SOL $BONK #BuyTheDip https://merrymen.xyz/t/0123456789abcdef`;
+    assert.equal(publishableThesis(row({ reason: null, post: plain }))!.post, plain);
   });
 });

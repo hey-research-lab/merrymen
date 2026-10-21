@@ -38,6 +38,7 @@
  * read for writing or written. Best-effort everywhere: a heartbeat that fails
  * to write is a missed beat, never a stopped fleet loop.
  */
+import { onchainIdIn } from "../../packages/core/src/ids";
 import { translateSchema, type Db } from "./db";
 import type { AutonomyFunnel, FleetRails, RailFunnel } from "./autonomy-funnel";
 
@@ -323,10 +324,11 @@ export interface PublicHeartbeat {
  * A KEY THAT CAN BE PUBLISHED: a word from a fixed vocabulary — a status, a
  * rail, a hold kind, a funnel field. Never anything that starts like a number,
  * holds an `0x`, or carries a long hex run, so an account cannot arrive as a
- * key any more than as a value.
+ * key any more than as a value. Nor a Solana key: 32-44 base58 characters
+ * fit the shape and carry no 0x, so core's detector is asked too.
  */
 const SAFE_KEY = /^[A-Za-z][A-Za-z0-9 _()-]{0,47}$/;
-const noAccount = (k: string): boolean => !/0x/i.test(k) && !/[0-9a-f]{16,}/i.test(k);
+const noAccount = (k: string): boolean => !/0x/i.test(k) && !/[0-9a-f]{16,}/i.test(k) && !onchainIdIn(k);
 const safeKey = (k: string): boolean => SAFE_KEY.test(k) && noAccount(k);
 /** The rollout's name for itself — "none", "all", "3 named" — under the same rule. */
 const safeScope = (k: string): boolean => /^[A-Za-z0-9][A-Za-z0-9 _()-]{0,47}$/.test(k) && noAccount(k);

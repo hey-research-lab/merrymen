@@ -1,4 +1,5 @@
 /** Select public comments conservatively. Pure: no model, credentials, trading state or I/O. */
+import { onchainIdIn } from "../../../packages/core/src/ids";
 import type { XReply } from "./client";
 import { checkAsk, checkAskText, checkTargetOf, type CheckFrom, type CheckTarget } from "./check";
 
@@ -126,6 +127,19 @@ export type ReplyCandidate =
   | { ok: false; reason: string };
 
 const LINK_OR_SECRET = /https?:|www\.|\b[a-z0-9-]+\.(?:com|net|org|io|dev|app|xyz|gg|co|me|ai)\b|0x[a-f0-9]{8,}|\b(?:sk-|gsk_|api[ _-]?key|seed phrase|private key|password|secret)\b/i;
+/**
+ * LINK_OR_SECRET, or a Solana key or signature (core's onchainIdIn): base58 has
+ * no 0x for the hex arm to see. The glued scan (audit regressions F3): a tag or
+ * a comment carrying "CA<mint>" or "<key>is" is refused before any model reads
+ * it, as one with a bare id is; the reply is checked again at send
+ * (public-wallet.ts). The scan's one cost elsewhere, an unbroken base58 run of
+ * 43 or more characters such as a long camelCase hashtag, hardly reaches here:
+ * both paths refuse "#" as unsafe-text first, and the comment path any digit.
+ * A long number glued to a word ("<digits>tokens") can reach a tag, and may
+ * cost it: the tag is refused, as fail closed as any refusal here.
+ */
+const GLUED = { glued: true } as const;
+const linkOrSecret = (text: string): boolean => LINK_OR_SECRET.test(text) || onchainIdIn(text, GLUED);
 const ABUSE_OR_SENSITIVE = /\b(?:fuck\w*|shit\w*|bitch\w*|idiot\w*|moron\w*|retard\w*|kill\w*|suicid\w*|rape\w*|porn\w*|sex\w*|nude\w*|terror\w*|nazi\w*|racis\w*|politic\w*|election\w*|president\w*|democrat\w*|republican\w*|religio\w*|christian\w*|muslim\w*|jew\w*|medical\w*|diagnos\w*|cancer|medication\w*|depress\w*)\b/i;
 /**
  * DISTRESS, HOWEVER IT IS PUT (red-team review, 2026-10-12): "i lost my life
@@ -273,7 +287,7 @@ export function replyCandidate(
   const text = withoutLeadingMentions(reply.text.normalize("NFKC")).replace(/\s+/g, " ").trim();
   if (text.length < 8 || text.length > XREPLY_MAX_COMMENT_CHARS || (text.match(/\p{L}+/gu) ?? []).length < 3) return no("low-signal");
   if (/[\u0000-\u001f\u007f«»<>]|\p{N}|[@#]|\p{Script=Cyrillic}|\p{Script=Han}/u.test(text)) return no("unsafe-text");
-  if (LINK_OR_SECRET.test(text)) return no("link-or-secret");
+  if (linkOrSecret(text)) return no("link-or-secret");
   if (ABUSE_OR_SENSITIVE.test(text)) return no("sensitive");
   if (DISTRESS.test(text) || STAKES.test(text)) return no("distress");
   if (SPAM_OR_INSTRUCTIONS.test(text)) return no("spam-or-instructions");
@@ -817,7 +831,7 @@ export function tagCandidate(reply: XReply, ctx: {
   // most (strayInTag). A reaction's two trailing emoji were already read and
   // set aside by its allowlist; its words are held to the same rule.
   if (strayInTag(reaction ? reacted : confused ? puzzled : text)) return no("unsafe-text");
-  if (LINK_OR_SECRET.test(text)) return no("link-or-secret");
+  if (linkOrSecret(text)) return no("link-or-secret");
   if (ABUSE_OR_SENSITIVE.test(text)) return no("sensitive");
   // Before the advice flag: a "should i" about a life, or money or a home someone cannot lose, is never a decline's to answer (DISTRESS, STAKES, LIFE_STAKES).
   if (DISTRESS.test(text) || STAKES.test(text) || LIFE_STAKES.test(text)) return no("distress");

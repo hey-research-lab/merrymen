@@ -109,3 +109,65 @@ test("Postgres: repeated ledger setup does not queue exclusive locks behind publ
     await admin.end();
   }
 });
+
+/**
+ * THE EVM-ONLY TX-HASH FOLD, ON POSTGRES (Solana P0; audit merge-history 2b(1)).
+ *
+ * Every open runs `UPDATE flows SET tx_hash = LOWER(tx_hash) WHERE ... AND <0x + 64 hex>`
+ * through applyLedgerMigrations, which swallows a non-ALTER statement's error. So if
+ * that test (LENGTH/SUBSTR/LTRIM, written to read the same on both engines) failed on
+ * Postgres, upper-case EVM hashes would silently stop folding (and a deposit could be
+ * counted twice beside its lower-case twin), and nothing would say so. ledger-hash-case
+ * .test.ts proves it on SQLite; this proves it here, over two opens.
+ */
+test("Postgres: the open-time fold lowercases EVM hashes and leaves a Solana signature as written", { skip: !url, timeout: 60_000 }, async () => {
+  const target = new URL(url!);
+  assert.ok(["localhost", "127.0.0.1", "[::1]"].includes(target.hostname), "only a disposable local PostgreSQL is allowed");
+  const pg = createRequire(import.meta.url)("pg") as { Client: new (config: { connectionString: string }) => Client };
+  const schema = `mm_hash_fold_${randomBytes(8).toString("hex")}`;
+  const admin = new pg.Client({ connectionString: target.toString() });
+  await admin.connect();
+  await admin.query(`CREATE SCHEMA ${schema}`);
+  try {
+    const scoped = new URL(target);
+    scoped.searchParams.set("options", `-c search_path=${schema} -c statement_timeout=5000`);
+    scoped.searchParams.set("application_name", "ledger-hash-fold-test");
+    const db = await makePgDb(scoped.toString());
+    await applyLedgerSchema(db);
+    // A book from before the identity index, as ledger-hash-case.test.ts builds one.
+    await db.exec("DROP INDEX IF EXISTS flows_chain_identity");
+    await db.exec("DELETE FROM flows");
+    const ACCOUNT = "0x00000000000000000000000000000000000000c1", CHAIN = 4663;
+    await db.prepare(`INSERT INTO agents (smart_account, owner_address, session_key_address, chain_id, caps, granted_at, expires_at, mode)
+      VALUES (?, ?, ?, ?, '{}', 0, 0, 'live')`).run(ACCOUNT, ACCOUNT, ACCOUNT, CHAIN);
+    const LOWER = `0x${"0123456789abcdef".repeat(4)}`;
+    const UPPER = `0x${"0123456789ABCDEF".repeat(4)}`;
+    const MIXED = `0x${"aBcDeF01".repeat(8)}`;
+    const CAPITAL_X = `0X${"FEDCBA98".repeat(8)}`;
+    // Base58, 64 bytes, upper case in it to lose: a Solana signature's shape.
+    const SIGNATURE = "5VERv8NMvzbJMEkV8xnrLkEaWRtSz9CosKDYjCJjBRnbJLgp8uirBgmQpjKhoR4tjF3ZpRzrFmBV6UjKdiSZkQUW";
+    // 66 characters with a 0x, but not hex throughout: not an EVM hash, kept as written.
+    const NOT_HEX = `0x${"ABCDEFGH".repeat(8)}`;
+    const rows: Array<[string | null, number | null, string, number | null]> = [
+      [LOWER, 0, "chain-log", CHAIN], [UPPER, 1, "chain-log", null], [MIXED, null, "transfer-intent", CHAIN],
+      [CAPITAL_X, 2, "chain-log", CHAIN], [SIGNATURE, 3, "chain-log", CHAIN], [NOT_HEX, 4, "chain-log", CHAIN], [null, null, "inferred", null],
+    ];
+    for (const [tx, log, source, chain] of rows) {
+      await db.prepare(`INSERT INTO flows (agent_id, direction, amount_usdg, tx_hash, block_number, log_index, source, epoch, chain_id, at)
+        VALUES (?, 'in', 10, ?, ?, ?, ?, 1, ?, ?)`).run(ACCOUNT, tx, tx === null ? null : 100, log, source, chain, 1_790_000_000);
+    }
+    const expected = [LOWER, UPPER.toLowerCase(), MIXED.toLowerCase(), CAPITAL_X.toLowerCase(), SIGNATURE, NOT_HEX, null];
+    for (const open of [1, 2]) {
+      await applyLedgerSchema(db);
+      const got = await db.prepare("SELECT tx_hash, chain_id FROM flows ORDER BY id").all() as Array<{ tx_hash: string | null; chain_id: number | null }>;
+      assert.deepEqual(got.map((r) => r.tx_hash), expected, `open ${open}: every EVM hash folded, the signature byte for byte`);
+      assert.equal(Number(got[1]!.chain_id), CHAIN, `open ${open}: the legacy row gets its chain from the grant`);
+    }
+    // The identity index came back over the folded rows.
+    const index = await db.prepare("SELECT to_regclass('flows_chain_identity') IS NOT NULL AS present").get() as { present: boolean };
+    assert.equal(index.present, true);
+  } finally {
+    await admin.query(`DROP SCHEMA ${schema} CASCADE`);
+    await admin.end();
+  }
+});

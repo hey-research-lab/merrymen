@@ -610,6 +610,8 @@ import {
 import { quoteDecimalsOf, readCurveReserves, readCurveThreshold } from "./venues/pons";
 import { decodeClassLog, foldClassEvents, readClassLog } from "./venues/class-log";
 import { reconcileClassBook, scoutCostOf } from "./class-reconcile";
+import { selfHostedSolanaKill } from "./solana-kill";
+import type { KillResult } from "./telegram/kill-confirm";
 
 const BREAKER_ABI = parseAbi(["function isTripped(address account) view returns (bool)"]);
 /** The one read the onchain reconstruction checks itself against. */
@@ -15178,7 +15180,18 @@ async function main() {
     // A renewal or +1h of a tail whose 30 notices are spent says so (read-only).
     fomoTailCapSpent: (userId) => (fomoOff ? Promise.resolve(null) : fomoTailNotifier.capSpent(userId)),
     fomoTailsState,
-    kill: () => {
+    kill: async () => {
+      // SELF-HOSTED, the local Solana strategy is stopped first, whatever happens to the grant
+      // below (an archive it cannot write keeps the grant and pauses instead), as the web's
+      // "Kill all agents" does. Hosted, the orchestrator stops the tenant's (kill-request.ts).
+      const solana = isHostedMode() ? null : await selfHostedSolanaKill();
+      if (solana === "not-stopped") console.log("[kill] the local Solana strategy could not be stopped; the owner is told to /kill again");
+      const result = robinhoodKill();
+      return solana ? { ...result, solana } : result;
+    },
+  });
+  /** The Robinhood Chain half of the Telegram kill switch. */
+  function robinhoodKill(): KillResult {
       try {
         const grant = loadGrantFile();
         if (isHostedMode()) {
@@ -15243,8 +15256,7 @@ async function main() {
       } catch (e) {
         return { ok: false, reason: e instanceof Error ? e.message : String(e) };
       }
-    },
-  });
+  }
 
   // The merryman speaks first: trade pings, warnings, price alerts, the daily
   // campfire report — pushed to the owner chat, gated by telegramNotifyEnabled.

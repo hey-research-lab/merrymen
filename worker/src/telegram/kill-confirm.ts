@@ -27,6 +27,20 @@ export interface KillResult {
   revocation?: "queued" | "failed";
   /** The owner key could not be archived: keep the grant and pause instead. */
   archiveFailed?: { why: string; paused: boolean };
+  /**
+   * SELF-HOSTED only: what the kill did to the local Solana strategy, which it
+   * stops whatever happens to the grant. Absent when there was none to stop.
+   */
+  solana?: "stopped" | "not-stopped";
+}
+
+/** The kill's Solana line, after the rest of the answer. */
+function solanaLine(r: KillResult): string {
+  if (r.solana === "not-stopped") return `
+⚠️ Kill incomplete: your Solana strategy could not be stopped and may still trade. /kill again.`;
+  if (r.solana === "stopped") return `
+Your Solana strategy is stopped too.`;
+  return "";
 }
 
 /** The question /kill asks before anything happens. */
@@ -50,6 +64,9 @@ export function killPromptText(hosted: boolean, ttlSec = CONFIRM_TTL_SEC): strin
 
 /** The answer once /confirm has run the kill. */
 export function killDoneText(r: KillResult): string {
+  return robinhoodKillText(r) + solanaLine(r);
+}
+function robinhoodKillText(r: KillResult): string {
   // Before the `!r.ok` line: this is not "nothing to kill". There was a
   // grant, and it was deliberately left alone.
   if (r.archiveFailed) {

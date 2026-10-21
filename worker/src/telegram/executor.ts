@@ -127,7 +127,7 @@ export interface CommandDeps {
    * `archived` names the account kept. Hosted it queues the store removal
    * (`revocation`).
    */
-  kill(): KillResult;
+  kill(): KillResult | Promise<KillResult>;
   link(code: string): { ok: boolean; reason?: string };
   /** Build a bounded TradeIntent and route it through processIntent → policy wall. */
   trade(side: "buy" | "sell", symbol: string, usdg: number): Promise<string>;
@@ -374,7 +374,7 @@ export async function executeCommand(cmd: Command, deps: CommandDeps): Promise<s
         case "kill":
           // What THIS agent did, in the words the hold process uses too
           // (kill-confirm.ts).
-          return killDoneText(deps.kill());
+          return killDoneText(await deps.kill());
         case "fomo-tail":
           // A typed /confirm, or "Tell me only", is tell-only; only the
           // consider button asks for more, and the service checks it again.

@@ -26,7 +26,7 @@ import { join } from "node:path";
 import { after, describe, it } from "node:test";
 import {
   DEPLOY_GUARD_IMAGE, EX_CONFIG, EX_USAGE, hostedOrchestratorRefusals, isOneShotVariable, oneShotCensus,
-  onRailway, runDeployGuard, START_ROLES, type GuardResult,
+  hostedSolanaRefusals, onRailway, runDeployGuard, START_ROLES, type GuardResult,
 } from "./deploy-guard-checks";
 
 const ROOT = join(import.meta.dirname, "..", "..");
@@ -151,10 +151,51 @@ describe("--phase=start", () => {
       for (const role of ["start:evil", "dev:worker", "start:web ", "", "$(id)"]) {
         const r = await start(role, env);
         assert.equal(r.code, EX_USAGE, role);
-        assert.deepEqual(r.err, ["[deploy-guard] refused: --role is not one of: start:web start:orchestrator start:recovery-replies"]);
+        assert.deepEqual(r.err, ["[deploy-guard] refused: --role is not one of: start:web start:orchestrator start:recovery-replies start:solana"]);
         assert.deepEqual(r.out, []);
       }
     }
+  });
+});
+
+describe("the separate Solana role", () => {
+  const solana = { ...RAILWAY, RAILWAY_SERVICE_ID: OTHER_SERVICE, MERRYMEN_SOLANA_SERVICE_ID: OTHER_SERVICE,
+    MERRYMEN_FLEET_SERVICE_ID: SERVICE, DATABASE_URL: "postgres://fixture.invalid/solana", MERRYMEN_IMAGE: DEPLOY_GUARD_IMAGE };
+  const cases = [
+    { name: "its own service and shared database", env: solana, refusals: [] },
+    { name: "missing service selection", env: without(solana, "MERRYMEN_SOLANA_SERVICE_ID"), refusals: [/MERRYMEN_SOLANA_SERVICE_ID is not set/] },
+    { name: "different service", env: { ...solana, MERRYMEN_SOLANA_SERVICE_ID: "not-this-service" }, refusals: [/not the Solana service/] },
+    { name: "the RH fleet service", env: { ...solana, MERRYMEN_FLEET_SERVICE_ID: OTHER_SERVICE }, refusals: [/cannot replace the RH fleet service/] },
+    { name: "missing shared database", env: without(solana, "DATABASE_URL"), refusals: [/DATABASE_URL is not set/] },
+    { name: "blank shared database", env: { ...solana, DATABASE_URL: " " }, refusals: [/DATABASE_URL is not set/] },
+    { name: "wrong image", env: { ...solana, MERRYMEN_IMAGE: "old-image" }, refusals: [/MERRYMEN_IMAGE is not/] },
+  ];
+  for (const entry of cases) it(entry.name, async () => {
+    const start = await runDeployGuard(["--phase=start", "--role=start:solana"], entry.env);
+    const pre = await runDeployGuard(["--phase=predeploy"], { ...entry.env, MERRYMEN_START: "start:solana", RAILWAY_GIT_BRANCH: "main", RAILWAY_GIT_COMMIT_SHA: SHA });
+    assert.equal(start.code, entry.refusals.length ? EX_CONFIG : 0); assert.equal(pre.code, start.code);
+    assert.deepEqual(start.err, pre.err);
+    assert.equal(start.err.length, entry.refusals.length);
+    entry.refusals.forEach((pattern, i) => assert.match(start.err[i]!, pattern));
+    assert.deepEqual(start.err, hostedSolanaRefusals(entry.env).map(reason => `[deploy-guard] refused: ${reason}`));
+    if (entry.env.DATABASE_URL?.trim()) assert.ok(!all(start).includes(entry.env.DATABASE_URL));
+  });
+  it("local role is skipped and does not require hosted configuration", async () => {
+    assert.deepEqual(hostedSolanaRefusals({}), []);
+    assert.equal((await runDeployGuard(["--phase=start", "--role=start:solana"], {})).code, 0);
+  });
+  it("direct CLI refuses before creating state, while help skips hosted requirements", () => {
+    const dir = mkdtempSync(join(os.tmpdir(), "solana-cli-guard-"));
+    try {
+      const env = { PATH: process.env.PATH, HOME: dir, MERRYMEN_HOME: join(dir, "state"), RAILWAY_SERVICE_ID: OTHER_SERVICE };
+      const run = (args: string[]) => spawnSync(process.execPath, ["--import", "tsx", "worker/src/solana-agent-cli.ts", ...args], { cwd: ROOT, env, encoding: "utf8", timeout: 30_000 });
+      const refused = run([]); assert.equal(refused.status, EX_CONFIG, refused.stderr);
+      assert.match(refused.stderr, /MERRYMEN_SOLANA_SERVICE_ID is not set/);
+      assert.match(refused.stderr, /DATABASE_URL is not set/);
+      assert.ok(!refused.stderr.includes(OTHER_SERVICE)); assert.deepEqual(readdirSync(dir), []);
+      const help = run(["--help"]); assert.equal(help.status, 0, help.stderr);
+      assert.match(help.stdout, /merrymen solana-agent/); assert.deepEqual(readdirSync(dir), []);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 });
 
@@ -227,7 +268,7 @@ describe("--phase=predeploy", () => {
         const r = await predeploy({ ...PROD, ...FLEET, MERRYMEN_START: role }, noFetch);
         assert.equal(r.code, EX_CONFIG, JSON.stringify(role));
         assert.deepEqual(r.out, []);
-        assert.deepEqual(r.err, ["[deploy-guard] refused: MERRYMEN_START is not one of: start:web start:orchestrator start:recovery-replies (unset means start:web) — the start script would refuse it once this deploy had replaced the live one"]);
+        assert.deepEqual(r.err, ["[deploy-guard] refused: MERRYMEN_START is not one of: start:web start:orchestrator start:recovery-replies start:solana (unset means start:web) — the start script would refuse it once this deploy had replaced the live one"]);
       }
     });
 

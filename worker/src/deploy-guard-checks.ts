@@ -91,7 +91,7 @@ export const EX_CONFIG = 78;
 export const DEPLOY_GUARD_IMAGE = "dockerfile-v1";
 
 /** scripts/container-start.sh's allowlist, which is package.json's start:* scripts. */
-export const START_ROLES = ["start:web", "start:orchestrator", "start:recovery-replies"] as const;
+export const START_ROLES = ["start:web", "start:orchestrator", "start:recovery-replies", "start:solana"] as const;
 export type StartRole = (typeof START_ROLES)[number];
 export type FleetRole = Extract<StartRole, "start:orchestrator" | "start:recovery-replies">;
 const FLEET_ROLES: ReadonlySet<string> = new Set<FleetRole>(["start:orchestrator", "start:recovery-replies"]);
@@ -211,6 +211,19 @@ export function hostedOrchestratorRefusals(env: NodeJS.ProcessEnv): string[] {
   return onRailway(env) ? fleetStartChecks(env, "start:orchestrator").reasons : [];
 }
 
+/** Solana has its own service and shared accounting database; RH roles never start it. */
+export function hostedSolanaRefusals(env: NodeJS.ProcessEnv): string[] {
+  if (!onRailway(env)) return [];
+  const reasons: string[] = [];
+  const expected = env.MERRYMEN_SOLANA_SERVICE_ID ?? "", service = env.RAILWAY_SERVICE_ID ?? "";
+  if (!expected) reasons.push("MERRYMEN_SOLANA_SERVICE_ID is not set — the Solana worker requires its own explicitly selected Railway service");
+  else if (service !== expected) reasons.push("this is not the Solana service: RAILWAY_SERVICE_ID differs from MERRYMEN_SOLANA_SERVICE_ID");
+  if (service && service === env.MERRYMEN_FLEET_SERVICE_ID) reasons.push("the Solana worker cannot replace the RH fleet service — select a separate Solana service");
+  if (!env.DATABASE_URL?.trim()) reasons.push("DATABASE_URL is not set — hosted Solana authority and accounting require the shared database");
+  if (env.MERRYMEN_IMAGE !== DEPLOY_GUARD_IMAGE) reasons.push(`MERRYMEN_IMAGE is not ${DEPLOY_GUARD_IMAGE} — this is not the image whose start path delivers SIGTERM to node`);
+  return reasons;
+}
+
 export interface GuardResult {
   code: number;
   /** For stdout. */
@@ -299,6 +312,8 @@ async function predeploy(env: NodeJS.ProcessEnv, deps: GuardDeps): Promise<Guard
     const fleet = fleetStartChecks(env, role);
     out.push(censusLine(fleet.census));
     reasons.push(...fleet.reasons);
+  } else if (role === "start:solana") {
+    reasons.push(...hostedSolanaRefusals(env));
   }
   if (reasons.length) return refused(out, reasons);
   const repo = env.MERRYMEN_DEPLOY_ANCESTRY_REPO;
@@ -312,6 +327,10 @@ async function predeploy(env: NodeJS.ProcessEnv, deps: GuardDeps): Promise<Guard
 
 function start(env: NodeJS.ProcessEnv, role: StartRole): GuardResult {
   if (!onRailway(env)) return skipped("not running on Railway");
+  if (role === "start:solana") {
+    const reasons = hostedSolanaRefusals(env);
+    return reasons.length ? refused([], reasons) : { code: 0, out: [line(`ok role=${role}`)], err: [] };
+  }
   if (!isFleetRole(role)) return { code: 0, out: [line(`ok role=${role}`)], err: [] };
   const { census, reasons } = fleetStartChecks(env, role);
   const out = [censusLine(census)];

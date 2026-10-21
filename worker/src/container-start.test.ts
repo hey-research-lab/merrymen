@@ -350,7 +350,7 @@ describe("the script runs package.json's start scripts, and only those", { skip:
         const r = sandbox().run(shell, { MERRYMEN_START: value });
         assert.equal(r.status, 64, `${JSON.stringify(value)} was not refused: ${r.stdout}${r.stderr}`);
         assert.equal(r.stdout, "", `${JSON.stringify(value)} ran something`);
-        assert.match(r.stderr, /^\[start\] refused: MERRYMEN_START is not one of: start:web start:orchestrator start:recovery-replies$/m);
+        assert.match(r.stderr, /^\[start\] refused: MERRYMEN_START is not one of: start:web start:orchestrator start:recovery-replies start:solana$/m);
       }
       const r = sandbox().run(shell, { MERRYMEN_START: "$(id)" });
       assert.ok(!r.stderr.includes("$(id)") && !r.stderr.includes("uid="), r.stderr);

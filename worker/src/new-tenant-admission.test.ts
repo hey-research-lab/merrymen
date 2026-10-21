@@ -43,6 +43,8 @@ after(() => {
 });
 
 const address = (n: number) => `0x${n.toString(16).padStart(40, "0")}`;
+/** A Solana agent id over a real key: case-sensitive, never folded. */
+const SOL_AGENT = "sol:2u1tszSeqZ3qBWF3uNGPFc8TzMk2tdiwknnRMWGWjGWH";
 let next = 0x5000;
 /** A fresh tenant, account and owner, and a volume layout of its own with nothing in it yet. */
 function scopeFor(): NewTenantScope {
@@ -311,6 +313,20 @@ describe("newTenantRefusal: fails closed", () => {
     ];
     for (const b of bad) assert.equal((await newTenantRefusal(db, b))?.fact, false, JSON.stringify(b));
   });
+
+  it("a tenant whose id is not 0x is refused as a fact, before the volume or Postgres is read (fleet-id.ts)", async () => {
+    let reads = 0;
+    const untouchable = { prepare: () => { reads += 1; throw new Error("must not be read"); } } as unknown as Db;
+    for (const tenant of [SOL_AGENT, "rh:ABC-123", "0x123"]) {
+      const s = scopeFor();
+      // A home in the scope: read first, the answer would be "it has a home".
+      mkdirSync(s.homes[0]!);
+      assert.deepEqual(await newTenantRefusal(untouchable, { ...s, tenant }), {
+        why: "its id is not a Robinhood Chain address (0x and 40 hex), and this build admits no tenant on another chain", fact: true,
+      }, tenant);
+    }
+    assert.equal(reads, 0);
+  });
 });
 
 describe("admitNewTenant: proved again, and recorded, under the caller's lease", () => {
@@ -395,6 +411,15 @@ describe("admitNewTenant: proved again, and recorded, under the caller's lease",
     const r = await admitNewTenant(broken, { ...scopeFor(), level, nowMs: 1, mayWrite: yes });
     assert.equal(r.admitted, false);
   });
+
+  it("records nothing, and asks nothing, for a tenant whose id is not 0x (fleet-id.ts)", async () => {
+    const { raw, db } = await store();
+    let asked = 0;
+    const r = await admitNewTenant(db, { ...scopeFor(), tenant: SOL_AGENT, level, nowMs: 1, mayWrite: () => { asked += 1; return true; } });
+    assert.deepEqual(r, { admitted: false, why: "its id is not a Robinhood Chain address (0x and 40 hex), and this build admits no tenant on another chain", fact: true });
+    assert.equal(asked, 0, "not even the lease proof");
+    assert.equal(raw.prepare("SELECT name FROM sqlite_master WHERE name = 'fleet_new_tenant_admissions'").get(), undefined, "not even the table");
+  });
 });
 
 describe("the record", () => {
@@ -413,6 +438,18 @@ describe("the record", () => {
     ins.run("not-a-tenant", address(1));
     ins.run(`${address(0xdef)} `, address(1));
     assert.deepEqual(await readNewTenantAdmissions(db), new Set([address(0xabc)]));
+  });
+
+  it("hands every row that is not an address to the caller as written, and still admits nobody by it (fleet-id.ts)", async () => {
+    const { raw, db } = await store();
+    await ensureNewTenantAdmissions(db);
+    const ins = raw.prepare("INSERT INTO fleet_new_tenant_admissions VALUES (?, ?, 1, 'trade', 1, 'd')");
+    ins.run(address(0xabc).toUpperCase().replace("0X", "0x"), address(1));
+    ins.run(SOL_AGENT, address(1));
+    ins.run(`${address(0xdef)} `, address(1));
+    const unsupported: string[] = [];
+    assert.deepEqual(await readNewTenantAdmissions(db, (r) => unsupported.push(r)), new Set([address(0xabc)]));
+    assert.deepEqual(unsupported.sort(), [`${address(0xdef)} `, SOL_AGENT].sort(), "never case-folded, so the line names the row that is there");
   });
 
   it("is made once per database, and a second maker is harmless", async () => {

@@ -100,6 +100,21 @@ describe("the operator variables", () => {
     assert.throws(() => parseResumeRevokes(addr(3)), /entry 1 is not 0x<tenant>:<evidence digest>/);
     assert.throws(() => parseResumeRevokes(`${addr(3)}:${d},${addr(3)}:${d}`), /repeats/);
   });
+
+  it("refuse a tenant whose id is not 0x (fleet-id.ts) by position, as what it is, never echoing it", () => {
+    const key = "2u1tszSeqZ3qBWF3uNGPFc8TzMk2tdiwknnRMWGWjGWH", d = "a".repeat(64);
+    const notEvm = /entry 2 names a tenant that is not a complete Robinhood Chain address .*resumes no other chain's; refusing to start/;
+    const silent = (e: Error) => { assert.ok(!e.message.includes(key.slice(0, 8)), e.message); return true; };
+    for (const tenant of [`sol:${key}`, key]) {
+      assert.throws(() => parseResumePreview(`${addr(1)},${tenant}`), (e: Error) => notEvm.test(e.message) && silent(e));
+      assert.throws(() => parseResumeApprovals(`${addr(1)}:${d},${tenant}:${d}`), (e: Error) => notEvm.test(e.message) && silent(e));
+      assert.throws(() => parseResumeRevokes(`run:${d},${tenant}:${d}`), (e: Error) => notEvm.test(e.message) && silent(e));
+    }
+    // A mistyped address is refused the same way; a shape that is not tenant:digest at all keeps its own words.
+    assert.throws(() => parseResumeApprovals(`${addr(1)}:${d},0x12:${d}`), notEvm);
+    assert.throws(() => parseResumeApprovals(`${addr(1)}:${d},:${d}`), /entry 2 is not 0x<tenant>:<evidence digest>/);
+    assert.throws(() => parseResumeRevokes(`${addr(1)}:${d},sol:${key}`), /entry 2 is not 0x<tenant>:<evidence digest>/);
+  });
 });
 
 describe("the preconditions", () => {

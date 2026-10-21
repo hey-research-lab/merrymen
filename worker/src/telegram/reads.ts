@@ -20,7 +20,7 @@ import { rejectRuleLabel, rejectRuleRemedy } from "../thesis-policy";
 // RELATIVE import only — the "@merrymen/core" alias exists solely in dev (see
 // the note in service.ts). isHostedMode decides whether a missing agent id may
 // fall back to the single-tenant guess, or must refuse.
-import { liveBlockerText, priceSourceNote, priceSourceTag, isHostedMode, ENERGY } from "../../../packages/core/src/index";
+import { liveBlockerText, priceSourceNote, priceSourceTag, isHostedMode, ENERGY, idFamily, redactSolanaIds } from "../../../packages/core/src/index";
 import type { EnergyStatus } from "../../../packages/core/src/index";
 import { count as countTokens, STILL_RUNS } from "../energy-copy";
 import type { AdmissionLevel } from "../worker-admission";
@@ -940,15 +940,68 @@ export function readWhyEvidence(agentId?: string | null): { text: string; hasTra
  * provider with every chat message. The model is told to point people to
  * /wallet instead; this makes sure it has nothing else to go on.
  *
- * Every 0x run of 20–40 hex digits standing alone is replaced — 40 is an
- * address, and a shorter run is one cut off by a length cap, still most of an
- * address. A longer run (a 64-digit transaction hash) is left alone: nothing
- * can be sent to it. The owner-facing alert, /status and report keep their
- * addresses; only what a model reads is redacted.
+ * Every 0x run of 20 or more hex digits is replaced, wherever it starts
+ * ("tx0x<address>" too). 40 digits is an address, and a shorter run is one cut
+ * off by a length cap, still most of an address: "[address]". A longer run can
+ * carry an address inside it ("0x<address><24 hex>"), so it goes too: a run of
+ * exactly 64 is "[hash]" (a transaction hash, or that, or a private key; the
+ * model needs none of them), any other length "[address]". The owner-facing
+ * alert, /status, report and trade notices keep their addresses and hashes;
+ * only what a model reads is redacted, and where it narrates the daily
+ * report, the owner still gets the report itself, hashes included,
+ * underneath. So does /why (why-answer.ts): its evidence reaches the model
+ * through here, and the owner gets their own evidence, unredacted, when
+ * narration fails, or the receipt's tx line under a narration.
+ *
+ * A Solana key (base58, 32 bytes, found by core's onchainIdsIn) is an address
+ * the same way and is replaced too, inside an explorer link as well, and glued
+ * to the words around it ("CA<mint>", "<mint>is": core's glued scan, audit
+ * regressions F3). Redaction takes the glued scan because its one cost, an
+ * unbroken base58 run of 43 or more characters (a long camelCase hashtag, or a
+ * long number glued to a word as in "<digits>tokens") read as an id, is a word
+ * shown to a model as "[address]", never text withheld.
+ * A Solana signature, standing alone or in a link, is replaced too, by
+ * "[signature]", where a 0x tx hash is left: a base58 run that decodes to 64
+ * bytes cannot be told apart from two keys written together ("<mint><mint>")
+ * or a key with a word glued on ("CA<mint><41 characters>"), and the model
+ * needs no signature (the owner's own report keeps it). A glued run the scan
+ * reads as a signature is replaced by "[address]", as any glued run is. A
+ * base58 key cut short does not decode, so unlike a cut 0x run it is not
+ * caught.
  */
-const ADDRESS_RUN = /\b0x[0-9a-fA-F]{20,40}(?![0-9a-fA-F])/g;
+/** An ASCII hex digit. */
+function hexDigit(code: number): boolean {
+  return (code >= 48 && code <= 57) || (code >= 65 && code <= 70) || (code >= 97 && code <= 102);
+}
+/**
+ * Every "0x" or "0X" followed by 20 or more hex digits, the whole run, as
+ * "[hash]" (64 digits) or "[address]": what /0[xX]([0-9a-fA-F]{20,})/g
+ * matched, found by one linear pass. EVERY QUANTIFIER IS BOUNDED
+ * (telegram/agent.ts): the unbounded regex overflowed V8's backtracking stack
+ * on a run of a few million hex digits, and a throw here skips the daily
+ * digest and every event read the model is given.
+ */
+export function redactHexRuns(text: string): string {
+  let out = "", last = 0;
+  for (let i = 0; i + 1 < text.length; i++) {
+    if (text.charCodeAt(i) !== 48 || (text.charCodeAt(i + 1) | 32) !== 120) continue;
+    let end = i + 2;
+    while (end < text.length && hexDigit(text.charCodeAt(end))) end++;
+    if (end - i - 2 < 20) continue;
+    out += text.slice(last, i) + (end - i - 2 === 64 ? "[hash]" : "[address]");
+    last = end;
+    i = end - 1;
+  }
+  return last === 0 ? text : out + text.slice(last);
+}
 export function redactAddresses(text: string): string {
-  return text.replace(ADDRESS_RUN, "[address]");
+  // Longest value first (core's redactSolanaIds): a glued run can end in a key that also stands alone.
+  // A whole run that is itself a signature (idFamily: it decodes to 64 bytes) is named as one.
+  // Solana first, on the text as written: redactHexRuns takes "0x" and its hex, so run first on
+  // "0x<hex><key>" it ate the key's leading hex and left a tail too short to decode (review GE,
+  // round 2). The glued scan skips a run that is "0x" then hex alone, so an address is still redactHexRuns's.
+  const solana = redactSolanaIds(text, (hit) => (hit.shape === "hash" && idFamily(hit.value) === "solana" ? "[signature]" : "[address]"));
+  return redactHexRuns(solana);
 }
 
 /** Recent event-feed lines (for the LLM's context) — addresses redacted. */

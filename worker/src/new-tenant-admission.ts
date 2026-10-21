@@ -76,6 +76,7 @@ import { createHash } from "node:crypto";
 import { lstatSync } from "node:fs";
 import path from "node:path";
 import { rootDb, type Db } from "./db";
+import { parseFleetId } from "./fleet-id";
 import { sharedLedgerHistory } from "./ledger-import";
 import { AUTO_PAPER_HEADROOM } from "./ledger-resume";
 import type { AdmissionLevel } from "./worker-admission";
@@ -254,11 +255,25 @@ export function ensureNewTenantAdmissions(db: Db): Promise<void> {
   return done;
 }
 
-/** Every tenant the route has admitted, lowercase. A table not made yet is nobody. Throws on any other failure. */
-export async function readNewTenantAdmissions(db: Pick<Db, "prepare">): Promise<Set<string>> {
+/**
+ * Every tenant the route has admitted, lowercase. A table not made yet is
+ * nobody. Throws on any other failure.
+ *
+ * A row whose tenant is not a 0x address admits nobody, as before, and is now
+ * handed to `onUnsupported` as it was written, so the orchestrator says so
+ * rather than leave it a row nobody hears about.
+ */
+export async function readNewTenantAdmissions(db: Pick<Db, "prepare">, onUnsupported?: (raw: string) => void): Promise<Set<string>> {
   try {
     const rows = (await db.prepare("SELECT tenant FROM fleet_new_tenant_admissions").all()) as Array<{ tenant: unknown }>;
-    return new Set(rows.map((r) => String(r.tenant).toLowerCase()).filter((t) => ADDRESS.test(t)));
+    const admitted = new Set<string>();
+    for (const r of rows) {
+      const raw = String(r.tenant);
+      const id = parseFleetId(raw.toLowerCase());
+      if (id?.kind === "evm") admitted.add(id.id);
+      else onUnsupported?.(raw);
+    }
+    return admitted;
   } catch (e) {
     if (absentTable(e)) return new Set();
     throw e;
@@ -280,9 +295,23 @@ function failureKind(e: unknown): string {
   return `${name}${code}`;
 }
 
+/**
+ * A TENANT WHOSE ID IS NOT 0x AND 40 HEX (fleet-id.ts) is refused before
+ * anything is read, as a fact: this build admits no other chain's, and asking
+ * again will not change that. It used to reach scopeOk's throw and be read as
+ * a failed read, retried every pass. A 0x id in the wrong case, and anything
+ * that is no id at all, still meet scopeOk, as before.
+ */
+function unsupportedTenant(tenant: unknown): NewTenantRefusal | null {
+  if (typeof tenant !== "string" || parseFleetId(tenant.toLowerCase())?.kind !== "unsupported") return null;
+  return { why: "its id is not a Robinhood Chain address (0x and 40 hex), and this build admits no tenant on another chain", fact: true };
+}
+
 /** The volume first (no read of Postgres for a tenant with a home), then Postgres. Read-only. */
 export async function newTenantRefusal(db: Pick<Db, "prepare">, s: NewTenantScope): Promise<NewTenantRefusal | null> {
   try {
+    const unsupported = unsupportedTenant(s.tenant);
+    if (unsupported) return unsupported;
     scopeOk(s);
     const onVolume = volumeHistory(s);
     if (onVolume) return { why: onVolume, fact: true, onVolume: true };
@@ -319,6 +348,9 @@ export type NewTenantAdmission =
 export async function admitNewTenant(db: Db, s: NewTenantScope & { level: AdmissionLevel; nowMs: number; mayWrite: () => boolean }): Promise<NewTenantAdmission> {
   const lost = "the right to record it went first (its lease, FLEET_HALT, a hold, a kill, or the route itself)";
   try {
+    // Before the lease proof and the table: nothing is written for it.
+    const unsupported = unsupportedTenant(s.tenant);
+    if (unsupported) return { admitted: false, ...unsupported };
     scopeOk(s);
     if (!s.mayWrite()) return { admitted: false, why: lost, fact: false };
     await ensureNewTenantAdmissions(db);

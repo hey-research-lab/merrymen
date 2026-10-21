@@ -333,13 +333,38 @@ export function hostedKillFromChat(
  */
 export const KILL_CLOCK_SLACK_SEC = 5;
 
+/**
+ * Left in the home by the call whose DELETE removed the grant while its Solana
+ * stop failed: the owner's ✅ is owed to the pass that finishes the stop. Not a
+ * request (no KILL_REQUEST_PREFIX), so it latches nothing. Taken by deleting it,
+ * so of two passes that both finish the stop exactly one reports `removed`. A child
+ * writing one itself can only bring a ✅ forward to a pass that found its grant
+ * gone and its Solana strategy stopped, which is then true.
+ */
+export const KILL_CONFIRM_OWED = "kill-confirm-owed";
+
+function oweKillConfirm(home: string): void {
+  // Best effort: lost, the owner gets no ✅ and was told what to do then (killHosted's reply).
+  try { writeFileSync(path.join(home, KILL_CONFIRM_OWED), "", { mode: 0o600 }); } catch { /* see above */ }
+}
+
+function takeKillConfirm(home: string): boolean {
+  try {
+    rmSync(path.join(home, KILL_CONFIRM_OWED));
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 export type KillOutcome =
   /** No pending request in this home. */
   | { outcome: "none" }
   /**
    * The stored grant is gone. Stand the child down. `removed` is true only for
-   * the one call whose DELETE removed it. That call confirms to the owner. A
-   * later pass finds it already absent.
+   * the one call whose DELETE removed it or, when that call's Solana stop
+   * failed, the one that then finished the stop (KILL_CONFIRM_OWED). That call
+   * confirms to the owner. A later pass finds it already absent.
    */
   | { outcome: "revoked"; request: KillRequest; removed: boolean }
   /**
@@ -362,12 +387,27 @@ export type KillOutcome =
  * the whole home, and until then it keeps the child latched. If the wipe
  * fails, the leftover request is harmless: the next grant the owner signs is
  * stored after it, comes back `newer`, and supersedes it.
+ *
+ * THE ROBINHOOD GRANT GOES FIRST. `afterRemove` stops what the grant does not
+ * cover (the tenant's Solana strategy). It runs on every pass that finds a
+ * readable request, after the conditional DELETE, so nothing on the Solana
+ * side can keep a killed Robinhood grant stored (the web's DELETE
+ * /api/grants removes it first too). A kill is still never reported done
+ * while the stop failed: the outcome is `failed`, the request stays pending
+ * (the reconcile keeps a home whose kill is not carried out), and the next
+ * pass finds the grant absent and retries the stop. The ✅ is owed by the
+ * call whose DELETE removed the grant: when its stop fails, it leaves
+ * KILL_CONFIRM_OWED in the home, and the pass whose stop then succeeds takes
+ * it and reports `removed`, so the owner is told exactly once, when both are
+ * done. The stop also runs when the request turns out superseded; stopping
+ * is the safe direction, and the newer grant arms once it succeeds.
  */
 export async function honourKillRequest(
   store: Pick<GrantStore, "removeUnlessNewer">,
   tenant: `0x${string}`,
   home: string,
   nowSec: number,
+  afterRemove?: () => Promise<unknown>,
 ): Promise<KillOutcome> {
   const request = readKillRequest(home, nowSec);
   if (!request) return { outcome: "none" };
@@ -384,7 +424,18 @@ export async function honourKillRequest(
   } catch (e) {
     return { outcome: "failed", request, error: e instanceof Error ? e.message : String(e) };
   }
-  if (result !== "newer") return { outcome: "revoked", request, removed: result === "removed" };
+  if (afterRemove) {
+    try { await afterRemove(); } catch (e) {
+      // Owed by this call alone: the DELETE that removed the grant happens once.
+      if (result === "removed") oweKillConfirm(home);
+      const grant = result === "newer" ? "a grant signed after the kill is kept" : "the Robinhood grant is removed";
+      return { outcome: "failed", request, error: `${grant}, but the Solana strategy could not be stopped: ${e instanceof Error ? e.message : String(e)}` };
+    }
+  }
+  if (result !== "newer") {
+    const owed = takeKillConfirm(home);
+    return { outcome: "revoked", request, removed: result === "removed" || owed };
+  }
   // SUPERSEDED, NOT DELETED: each killed grant's identity stays in this home.
   // Only the files this call read are renamed. A request the child wrote since
   // is one this rename never names, so it stays pending for the next pass.

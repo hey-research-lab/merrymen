@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { existsSync } from "node:fs";
 import { describe, it } from "node:test";
 
+import { SOLANA_USDG_MINT, TOKEN_2022_PROGRAM } from "../../packages/core/src/ids";
 import {
   formatRoi,
   formatUsdg,
@@ -227,6 +228,39 @@ describe("a trade row becomes a card only when it closed something knowable", ()
 
   it("a short address passed as the name still draws nothing", () => {
     assert.equal(pnlCardFromFill({ ...sell, target: "0x2ca2b5bd3b6635d630419c57a13c6b6a856ec96d" }, "0x020b…18b4"), null);
+  });
+
+  it("NEVER prints a Solana key as the coin either, as the target or as the name (Solana P0)", () => {
+    // A Solana row's target would be a program or a vault: base58, no 0x.
+    assert.equal(pnlCardFromFill({ ...sell, target: TOKEN_2022_PROGRAM }), null);
+    assert.equal(pnlCardFromFill({ ...sell, target: TOKEN_2022_PROGRAM }, SOLANA_USDG_MINT), null);
+    assert.equal(pnlCardFromFill({ ...sell, target: TOKEN_2022_PROGRAM }, "musebook")?.symbol, "musebook");
+    assert.equal(printableCoinName(SOLANA_USDG_MINT), null);
+    assert.equal(printableCoinName("musebook"), "musebook");
+  });
+
+  it("NEVER prints a Solana key glued to the words around it as the coin (audit regressions F3)", () => {
+    const letters = "EEuxbXvdXfvgGiFWKYyEksxzabPKjwhYTNvGXFitaqqT";
+    for (const name of [`CA${SOLANA_USDG_MINT}`, `buy${SOLANA_USDG_MINT}now`, `${letters}pump`]) {
+      assert.ok(name.length <= 64, name);
+      assert.equal(printableCoinName(name), null, name);
+      assert.equal(pnlCardFromFill({ ...sell, target: TOKEN_2022_PROGRAM }, name), null, name);
+      // Refused as the name, the card falls back to the target, a ticker here; as the target, it draws nothing.
+      assert.equal(pnlCardFromFill(sell, name)?.symbol, "DOGGOS", name);
+      assert.equal(pnlCardFromFill({ ...sell, target: name }), null, name);
+    }
+    for (const name of ["musebook", "PEPE 2", "BONKpump", "dogwifhat", "SuperLongCoinNameWithNoBreaks"]) assert.equal(printableCoinName(name), name);
+  });
+
+  it("NEVER prints a name with a whole 0x address inside it (tightened in Solana P0)", () => {
+    // Before, only a leading 0x was refused, so this was drawn as the coin.
+    const named = "PEPE 0x2ca2b5bd3b6635d630419c57a13c6b6a856ec96d";
+    assert.equal(printableCoinName(named), null);
+    assert.equal(printableCoinName(`PEPE 0x${"ab".repeat(32)}`), null);
+    // The name is refused and the card falls back to the target, a ticker here.
+    assert.equal(pnlCardFromFill(sell, named)?.symbol, "DOGGOS");
+    assert.equal(pnlCardFromFill({ ...sell, target: named }), null);
+    assert.equal(printableCoinName("PEPE 2"), "PEPE 2");
   });
 
   it("treats a realised zero as a real close, not as absent", () => {

@@ -422,6 +422,34 @@ const SQLITE_SCHEMA = `
 `;
 
 /**
+ * AN EVM TRANSACTION HASH, AND THE ONLY KIND OF HASH THE LEDGER CASE-FOLDS.
+ *
+ * 0x and 64 hex digits, either case, exactly as bookInitialCapital admits one
+ * (bookCapitalFlow admits the same with a lowercase x only). An EVM hash is
+ * case-insensitive, so it is kept lowercased: 0xAB… and 0xab… are one log to
+ * `flows_chain_identity`. Anything else is kept EXACTLY AS WRITTEN. A Solana
+ * signature is base58 and case-sensitive (packages/core/src/ids.ts), so a
+ * lowercased one names a signature that does not exist; and base58 has no "0",
+ * so no Solana id can ever take this shape.
+ *
+ * Every hash on the books today has this shape, so the rule changes nothing
+ * that is there: each one is still folded, to the same string as before.
+ *
+ * The SQL is the same test for the migration. Nothing engine-specific (no GLOB,
+ * no regex), so it reads the same on SQLite and Postgres; and no LOWER() inside
+ * the test, so no collation's folding can admit a character the JavaScript one
+ * refuses.
+ */
+const EVM_TX_HASH = /^0x[0-9a-f]{64}$/i;
+const EVM_TX_HASH_SQL =
+  "LENGTH(tx_hash) = 66 AND SUBSTR(tx_hash, 1, 2) IN ('0x', '0X') AND LTRIM(SUBSTR(tx_hash, 3), '0123456789abcdefABCDEF') = ''";
+
+/** A tx hash as the ledger keeps it: an EVM hash lowercased, anything else exactly as written. */
+function ledgerTxHash(raw: string): string {
+  return EVM_TX_HASH.test(raw) ? raw.toLowerCase() : raw;
+}
+
+/**
  * Additive migrations, applied after the CREATE block on every open. Each is
  * idempotent: sqlite throws "duplicate column" on re-run and the loop swallows it;
  * the Postgres translation turns each into ADD COLUMN IF NOT EXISTS.
@@ -858,7 +886,12 @@ const SQLITE_ALTERS: string[] = [
     //
     // The chain comes from the agent's own grant rather than from config,
     // because that is the chain the transaction was actually on.
-    "UPDATE flows SET tx_hash = LOWER(tx_hash) WHERE tx_hash IS NOT NULL AND tx_hash <> LOWER(tx_hash)",
+    //
+    // ONLY AN EVM HASH IS FOLDED (EVM_TX_HASH above). This runs on every open,
+    // so a Solana signature booked as written would otherwise be lowercased on
+    // the next one, out from under its own row and its journal entry.
+    `UPDATE flows SET tx_hash = LOWER(tx_hash)
+       WHERE tx_hash IS NOT NULL AND tx_hash <> LOWER(tx_hash) AND ${EVM_TX_HASH_SQL}`,
     `UPDATE flows SET chain_id = (SELECT a.chain_id FROM agents a WHERE a.smart_account = flows.agent_id)
        WHERE chain_id IS NULL AND tx_hash IS NOT NULL`,
     // PARTIAL — AND NOT FOR THE REASON AN EARLIER DRAFT OF THIS COMMENT GAVE.
@@ -2057,7 +2090,9 @@ interface FlowAccount {
  */
 async function insertFlowWithJournal(db: Db, flow: FlowRow, epoch: number, chainId: number | null): Promise<boolean> {
   const amount = Math.abs(flow.amountUsdg);
-  const txHash = flow.txHash ? flow.txHash.toLowerCase() : null;
+  // The row and its journal entry carry the one spelling: an EVM hash
+  // lowercased, any other exactly as written (ledgerTxHash).
+  const txHash = flow.txHash ? ledgerTxHash(flow.txHash) : null;
   const inserted = await db
     .prepare(
       `INSERT INTO flows (agent_id, direction, amount_usdg, tx_hash, block_number, log_index, source, epoch, chain_id)
@@ -2315,7 +2350,9 @@ export async function hasChainFlow(
   try {
     const row = await getDb()
       .prepare("SELECT 1 AS n FROM flows WHERE agent_id = ? AND tx_hash = ? AND log_index = ? LIMIT 1")
-      .get(agentId, txHash.toLowerCase(), logIndex);
+      // The spelling insertFlowWithJournal wrote it under (ledgerTxHash): a
+      // plain toLowerCase() would miss a signature booked as written.
+      .get(agentId, ledgerTxHash(txHash), logIndex);
     return row !== undefined && row !== null;
   } catch (e) {
     console.error("[store] flow lookup failed:", e);
@@ -2336,7 +2373,10 @@ export async function hasFlowForTx(agentId: string, txHash: string): Promise<boo
   try {
     const row = await getDb()
       .prepare("SELECT 1 AS n FROM flows WHERE agent_id = ? AND tx_hash = ? LIMIT 1")
-      .get(agentId, txHash.toLowerCase());
+      // The spelling insertFlowWithJournal wrote it under (ledgerTxHash). A
+      // plain toLowerCase() misses a signature booked as written, and the
+      // resolver would then book the same transfer a second time.
+      .get(agentId, ledgerTxHash(txHash));
     return row !== undefined && row !== null;
   } catch (e) {
     console.error("[store] flow-for-tx lookup failed:", e);

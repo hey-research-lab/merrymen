@@ -78,6 +78,7 @@
  * local supervisor, the test suites) unset keeps today's behaviour.
  */
 import { RAILWAY_ONLY_IDENTITY } from "./deploy-guard-checks";
+import { parseFleetId } from "./fleet-id";
 /**
  * What the child reads its own level from (ADMISSION_LEVEL_ENV), and what an
  * admitted child may do (AdmissionLevel: only these three ever reach a child).
@@ -154,7 +155,8 @@ export function railwayHosted(env: Env): boolean {
   return env.MERRYMEN_PERSISTENT_HOME_REQUIRED === "1" || RAILWAY_MARKERS.some((key) => env[key] !== undefined);
 }
 
-const ENTRY = /^(0x[0-9a-fA-F]{40}):(observe|exits-only|trade)$/;
+/** `<tenant>:<level>`. The tenant is fleet-id.ts's to read: only a 0x one is admitted. */
+const ENTRY = /^(.*):(observe|exits-only|trade)$/;
 const refuse = (why: string) =>
   new Error(`${FLEET_ROLLOUT_ENV} ${why}; refusing to start rather than guess which tenants it admits`);
 
@@ -169,8 +171,12 @@ function parseRollout(raw: string): FleetRollout {
     // The position, never the text: the value is an operator's, and an entry
     // that does not parse is not something to repeat into a log as if it were.
     const m = ENTRY.exec(entry);
-    if (!m) throw refuse(`entry ${i + 1} is not none, all or 0x<40 hex>:observe|exits-only|trade`);
-    const tenant = m[1]!.toLowerCase();
+    const id = m ? parseFleetId(m[1]) : null;
+    if (!m || !id) throw refuse(`entry ${i + 1} is not none, all or 0x<40 hex>:observe|exits-only|trade`);
+    // A Solana id, or any other that is not 0x and 40 hex: this build runs
+    // no such tenant, so naming one is a promise it cannot keep.
+    if (id.kind !== "evm") throw refuse(`entry ${i + 1} names a tenant that is not a complete Robinhood Chain address (0x and 40 hex), and this build admits no other chain's`);
+    const tenant = id.id;
     // Twice is ambiguous even at the same level: one of the two was meant to
     // be something else, and nobody can say which.
     if (levels.has(tenant)) throw refuse(`entry ${i + 1} names a tenant an earlier entry already named`);
@@ -259,6 +265,7 @@ export function newTenantLevel(env: Env = process.env): AdmissionLevel | null {
  * recorded, are new-tenant-admission.ts's and the orchestrator's questions.
  */
 export function newTenantRouteOpen(tenant: string, env: Env = process.env): boolean {
+  if (parseFleetId(tenant.toLowerCase())?.kind !== "evm") return false;
   if (newTenantLevel(env) === null) return false;
   const rollout = fleetRollout(env);
   return rollout.scope === "list" && !rollout.levels.has(tenant.toLowerCase());
@@ -271,8 +278,14 @@ export function newTenantRouteOpen(tenant: string, env: Env = process.env): bool
  * has admitted (new-tenant-admission.ts, lowercase). It is asked only for a
  * tenant an explicit list does not name, and answers at the level the variable
  * gives now; left out, or with the route shut, nothing differs from before.
+ *
+ * A TENANT WHOSE ID IS NOT 0x AND 40 HEX IS HELD, under every scope, `all`
+ * included (fleet-id.ts). This build has nothing to run one with, and under
+ * `all` it used to come back as `trade` like any other.
  */
 export function rolloutLevel(tenant: string, env: Env = process.env, admittedNew?: ReadonlySet<string>): RolloutLevel {
+  // Lowercased first, as every lookup below always was.
+  if (parseFleetId(tenant.toLowerCase())?.kind !== "evm") return "held";
   let rollout: FleetRollout;
   try {
     rollout = fleetRollout(env);

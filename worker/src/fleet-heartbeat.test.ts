@@ -11,6 +11,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { describe, it } from "node:test";
+import { SOLANA_USDG_MINT, TOKEN_2022_PROGRAM } from "../../packages/core/src/ids";
 import { wrapSqlite } from "./db";
 import { RAIL_CONTRADICTORY, RAIL_NO_WORKER, RAIL_RESPAWNING, foldFunnel } from "./autonomy-funnel";
 import {
@@ -284,6 +285,17 @@ describe("what may be served", () => {
     assert.equal(h.counts, null);
     assert.equal(h.lastShutdown, null);
     assert.doesNotMatch(JSON.stringify(h), ADDRESS);
+  });
+
+  it("a Solana key is an account too, as a key or as a rollout scope (Solana P0)", () => {
+    // It starts with a letter, fits SAFE_KEY, and holds no 0x and no long hex run.
+    const SOL = TOKEN_2022_PROGRAM;
+    assert.deepEqual(numbersOnly({ armed: 3, [SOL]: 1, nested: { live: 2, [SOL]: 9 } }), { armed: 3, nested: { live: 2 } });
+    const row = (scope: string) =>
+      publicHeartbeat({ role: "orchestrator", beat_at: "10", rollout: JSON.stringify({ scope, levels: { trade: 1 } }) }, 20)!;
+    assert.equal(row(SOL).rollout, null);
+    assert.equal(row(SOLANA_USDG_MINT).rollout, null);
+    assert.deepEqual(row("3 named").rollout, { scope: "3 named", levels: { trade: 1 } });
   });
 });
 

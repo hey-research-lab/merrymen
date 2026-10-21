@@ -24,6 +24,8 @@ import type { PublicClient } from "viem";
 import {
   CASH,
   calculateChatMath,
+  chainInfo,
+  chainOfEvmId,
   chatPeriodStart,
   STOCK_TOKENS,
   isEvidencedFlow,
@@ -1225,6 +1227,21 @@ const settingsTool: ChatTool = {
   },
 };
 
+/**
+ * Which network a grant was signed on, for the owner. "Not real money" comes
+ * from the chain registry (ids.ts), never from "not mainnet": an id the
+ * registry does not name used to be called a test network, which tells an
+ * owner their money is not real when nothing here knows that. Reads exactly
+ * as before for 4663 and 46630.
+ */
+function signedNetwork(chainId: unknown): string {
+  const chain = chainInfo(chainOfEvmId(chainId));
+  if (chain?.realMoney === true) return `${chain.label} (real)`;
+  if (chain?.realMoney === false) return `${chainId} (test network — not real money)`;
+  const shown = typeof chainId === "number" && Number.isSafeInteger(chainId) ? String(chainId) : "unreadable";
+  return `${shown} (not one I recognise, so I can't say whether it is real money)`;
+}
+
 const permissionStatus: ChatTool = {
   spec: {
     name: "permission_status",
@@ -1248,7 +1265,7 @@ const permissionStatus: ChatTool = {
       false,
     );
     const lines = [
-      `Signed on network ${g.chainId === 4663 ? "Robinhood Chain (real)" : `${g.chainId} (test network — not real money)`}.`,
+      `Signed on network ${signedNetwork(g.chainId)}.`,
       `Signed ${when(g.grantedAt)}; runs out ${when(g.expiresAt)}${g.expiresAt <= ctx.now ? " — ALREADY RAN OUT" : ""}.`,
     ];
     if (ctx.status.grant) {

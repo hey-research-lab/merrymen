@@ -50,7 +50,7 @@ import { createCoinFactsReader, FactsLimiter } from "./desk/facts";
 import { resolveByName } from "./desk/evidence";
 import { searchPools } from "./desk/gecko";
 import { DISCOVERY_SCREEN, fetchGeckoPoolsResult, geckoSource, screenPools, type GeckoFetch, type GeckoPool } from "./venues/geckoterminal";
-import { CASH, instrumentClassOf, STOCK_TOKENS } from "../../packages/core/src/index";
+import { CASH, instrumentClassOf, onchainIdIn, STOCK_TOKENS } from "../../packages/core/src/index";
 import type { FomoBroker } from "./fomo/contract";
 import type { TokenActivityData, TokenThesesData } from "./fomo/tools";
 import type { FomoEnvelope } from "./fomo/types";
@@ -634,7 +634,19 @@ const DECLINE_NAMES: ReadonlySet<string> = new Set(("bitcoin btc ethereum eth et
 export function declinable(text: unknown, address: string | null = null): boolean {
   if (typeof text !== "string" || address !== null) return false;
   const t = text.normalize("NFKC");
-  if (/0x[0-9a-f]{6,}/i.test(t)) return false;
+  // A contract names a coin: 0x hex, or a Solana key or signature (core's onchainIdIn).
+  // THE DEFAULT SCAN IS ENOUGH HERE, not the glued one the public backstops use
+  // (audit regressions F3). A key glued to a word ("CA<mint>", "<key>is") splits
+  // at its digits into runs of letters, and a run of three or more that is no
+  // everyday word is read by nameLikeWords below as a coin's name DECLINE_NAMES
+  // does not hold, so the answer is false and nothing goes up. A glued key with
+  // no letter run read as a coin's name can be declined: the system program
+  // written "CA111…1" (which the glued scan does not read either: filler and hex
+  // alone are never an id glued to anything) or "111…1now" (which it does). It
+  // names no coin, and that is harmless, because a decline is code's own line,
+  // which never quotes the tag, and the reply is checked again at send
+  // (xpost/public-wallet.ts). The test pins the glued forms, these included.
+  if (/0x[0-9a-f]{6,}/i.test(t) || onchainIdIn(t)) return false;
   // Every $ and what follows it up to a space, whatever it holds ("$PEPE2", "$SANDY_HOOK"), and every word that might be a name.
   const tags = [...t.matchAll(/\$([^\s$]*)/g)].map((m) => m[1]!.toLowerCase().replace(/[.,!?;:'"’)]+$/u, ""));
   return [...tags, ...nameLikeWords(t)].every((n) => DECLINE_NAMES.has(n));

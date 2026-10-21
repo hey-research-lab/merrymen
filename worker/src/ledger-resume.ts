@@ -96,6 +96,7 @@ import { getLogsAdaptive, addressTopic, type RawLog } from "./inflight-reconcile
 import { CASH, ENTRYPOINT, chainForId } from "../../packages/core/src/index";
 import { isRootSuccessOf, ownerOperationOf, type OwnerReceiptLog } from "./owner-operations";
 import { tenantGrantAccount } from "./ledger-mirror";
+import { parseFleetId, type FleetId } from "./fleet-id";
 
 export const RESUME_PREVIEW_ENV = "MERRYMEN_RESUME_PREVIEW";
 export const RESUME_APPROVE_ENV = "MERRYMEN_RESUME_APPROVE";
@@ -138,10 +139,25 @@ export function parseResumePreview(raw: string | undefined): ResumePreviewScope 
   if (parts.length > MAX_NAMED) throw refuseEnv(RESUME_PREVIEW_ENV, `names more than ${MAX_NAMED} tenants`);
   const tenants = new Set<string>();
   parts.forEach((p, i) => {
-    if (!/^0x[0-9a-fA-F]{40}$/.test(p)) throw refuseEnv(RESUME_PREVIEW_ENV, `entry ${i + 1} is not all or a 0x tenant address`);
-    tenants.add(p.toLowerCase());
+    const id = parseFleetId(p);
+    if (!id) throw refuseEnv(RESUME_PREVIEW_ENV, `entry ${i + 1} is not all or a 0x tenant address`);
+    if (id.kind !== "evm") throw refuseEnv(RESUME_PREVIEW_ENV, notEvmTenant(i));
+    tenants.add(id.id);
   });
   return { scope: "list", tenants };
+}
+
+/**
+ * An entry naming a tenant whose id is not 0x and 40 hex (fleet-id.ts): a
+ * Solana one, or a mistyped address. Refused, by position, as every malformed
+ * entry is; said as what it is, since this build resumes no other chain.
+ */
+const notEvmTenant = (i: number) => `entry ${i + 1} names a tenant that is not a complete Robinhood Chain address (0x and 40 hex), and this build resumes no other chain's`;
+
+/** `0x<tenant>:<64 hex>`, the tenant read by fleet-id.ts: the entry, its tenant (null for any other shape) and its digest. */
+function tenantDigestEntry(p: string): { id: FleetId | null; digest: string } | null {
+  const m = /^(.*):([0-9a-f]{64})$/.exec(p);
+  return m ? { id: parseFleetId(m[1]), digest: m[2]! } : null;
 }
 
 export type ResumeApproval = { kind: "tenant"; tenant: string; digest: string } | { kind: "run"; run: string };
@@ -154,12 +170,14 @@ export function parseResumeApprovals(raw: string | undefined): ResumeApproval[] 
   const seen = new Set<string>();
   parts.forEach((p, i) => {
     const run = /^run:([0-9a-f]{64})$/.exec(p);
-    const one = /^(0x[0-9a-fA-F]{40}):([0-9a-f]{64})$/.exec(p);
-    if (!run && !one) throw refuseEnv(RESUME_APPROVE_ENV, `entry ${i + 1} is not 0x<tenant>:<evidence digest> or run:<preview run digest>`);
-    const key = run ? `run:${run[1]}` : one![1]!.toLowerCase();
+    const one = run ? null : tenantDigestEntry(p);
+    if (!run && !one?.id) throw refuseEnv(RESUME_APPROVE_ENV, `entry ${i + 1} is not 0x<tenant>:<evidence digest> or run:<preview run digest>`);
+    if (one?.id?.kind === "unsupported") throw refuseEnv(RESUME_APPROVE_ENV, notEvmTenant(i));
+    const tenant = one?.id?.kind === "evm" ? one.id.id : null;
+    const key = run ? `run:${run[1]}` : tenant!;
     if (seen.has(key)) throw refuseEnv(RESUME_APPROVE_ENV, `entry ${i + 1} repeats an earlier entry`);
     seen.add(key);
-    out.push(run ? { kind: "run", run: run[1]! } : { kind: "tenant", tenant: one![1]!.toLowerCase(), digest: one![2]! });
+    out.push(run ? { kind: "run", run: run[1]! } : { kind: "tenant", tenant: tenant!, digest: one!.digest });
   });
   return out;
 }
@@ -186,9 +204,11 @@ export function parseResumeRevokes(raw: string | undefined): ResumeRevoke[] {
   const seen = new Set<string>();
   return parts.map((p, i) => {
     const run = /^run:([0-9a-f]{64})$/.exec(p);
-    const one = /^(0x[0-9a-fA-F]{40}):([0-9a-f]{64})$/.exec(p);
-    if (!run && !one) throw refuseEnv(RESUME_REVOKE_ENV, `entry ${i + 1} is not 0x<tenant>:<evidence digest> or run:<preview run digest>`);
-    const out: ResumeRevoke = run ? { kind: "run", run: run[1]! } : { kind: "tenant", tenant: one![1]!.toLowerCase(), digest: one![2]! };
+    const one = run ? null : tenantDigestEntry(p);
+    if (!run && !one?.id) throw refuseEnv(RESUME_REVOKE_ENV, `entry ${i + 1} is not 0x<tenant>:<evidence digest> or run:<preview run digest>`);
+    if (one?.id?.kind === "unsupported") throw refuseEnv(RESUME_REVOKE_ENV, notEvmTenant(i));
+    const tenant = one?.id?.kind === "evm" ? one.id.id : null;
+    const out: ResumeRevoke = run ? { kind: "run", run: run[1]! } : { kind: "tenant", tenant: tenant!, digest: one!.digest };
     const key = out.kind === "run" ? `run:${out.run}` : `${out.tenant}:${out.digest}`;
     if (seen.has(key)) throw refuseEnv(RESUME_REVOKE_ENV, `entry ${i + 1} repeats an earlier entry`);
     seen.add(key);

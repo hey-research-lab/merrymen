@@ -1921,6 +1921,22 @@ describe("answer anything: every tag past the screens has a lane, and silence on
       assert.equal(classifyTag(text, { advice: true }).kind, "advice", text);
     }
     assert.equal(declinable("should i buy it?", CA), false, "never beside a contract");
+    // Nor beside a Solana one (Solana P0). The system program's id has no letters, so no word of it read as a name.
+    assert.equal(declinable("should i buy 2u1tszSeqZ3qBWF3uNGPFc8TzMk2tdiwknnRMWGWjGWH?"), false);
+    assert.equal(declinable(`should i buy ${"1".repeat(32)}?`), false);
+    // Nor beside one glued to a word (audit regressions F3): on the default scan, its letters are read as a coin's name.
+    const letters = "EEuxbXvdXfvgGiFWKYyEksxzabPKjwhYTNvGXFitaqqT";
+    for (const text of ["should i buy CA2u1tszSeqZ3qBWF3uNGPFc8TzMk2tdiwknnRMWGWjGWH?", `should i buy ca${letters}?`, `is ${letters}is going up?`,
+      `should i buy CA ${letters}?`, "should i buy 2u1tszSeqZ3qBWF3uNGPFc8TzMk2tdiwknnRMWGWjGWHnow?"]) {
+      assert.equal(declinable(text), false, text);
+      assert.equal(classifyTag(text, { advice: true }).kind, "unanswered", text);
+    }
+    // A glued key with no letter run read as a name can be declined: the system program, which names no coin.
+    // Harmless: the decline is code's own line, never quotes the tag, and is checked again at send (review GE, round 2).
+    for (const text of [`should i buy CA${"1".repeat(32)}?`, `should i buy CA${"1".repeat(43)}?`, `should i buy ${"1".repeat(32)}now?`]) {
+      assert.equal(declinable(text), true, text);
+      assert.equal(classifyTag(text, { advice: true }).kind, "advice", text);
+    }
   });
 
   it("its own mood is a strict allowlist too: a coin, a word more or another script and it is not one", () => {

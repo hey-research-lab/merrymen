@@ -5,7 +5,7 @@
  */
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { SETTINGS_DEFAULTS } from "../../../packages/core/src/index";
+import { SETTINGS_DEFAULTS, SOLANA_USDG_MINT } from "../../../packages/core/src/index";
 import { everyBand } from "../class-evidence";
 import { resetReasoningRefusalsForTest, type LlmCreds } from "../llm";
 import { similarity } from "../social-post";
@@ -1015,6 +1015,11 @@ describe("an active agent's answers and conversation memory", () => {
     }
     for (const q of ["what have you been buying lately?", "how do you pick your coins?", "gm, how's your day?", "", null]) assert.equal(coinNamedIn(q, names), false, String(q));
     assert.equal(coinNamedIn("gm, how are you?", ["GM"]), true, "errs toward a name: a coin called GM");
+    // A Solana contract names a coin as a 0x one does (Solana P0).
+    assert.equal(coinNamedIn(`thoughts on ${SOLANA_USDG_MINT}?`, names), true);
+    assert.equal(coinNamedIn(`is solscan.io/token/${SOLANA_USDG_MINT} legit?`, []), true);
+    // Glued to a word, it still names a coin: never answered from the agent's recent buys.
+    for (const q of [`did you buy CA${SOLANA_USDG_MINT}?`, `${SOLANA_USDG_MINT}is it legit?`, `CA:${SOLANA_USDG_MINT}x`]) assert.equal(coinNamedIn(q, []), true, q);
     const facts = { ...BASE, mode: "live" as const, recentBuys: [{ label: "Pepe", paper: false }], boughtLately: "live" as const, recentOwn: ["grabbed some pepe, the buying looked real"],
       said: ["grabbed some pepe, the buying looked real"], walletPublic: false };
     const research = ["you bought it lately", "your own words when you bought it: the buying looked steady", "what you posted on X about your latest buy: grabbed some pepe", "the public index shows liquidity is thin"];

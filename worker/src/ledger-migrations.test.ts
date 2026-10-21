@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { DatabaseSync } from "node:sqlite";
 import { wrapSqlite, type Db } from "./db";
-import { applyLedgerMigrations } from "./ledger-migrations";
+import { applyLedgerMigrations, ledgerMigrationSkipped } from "./ledger-migrations";
 
 test("existing columns skip ALTER while missing columns are added and checked afresh next pass", async () => {
   const raw = new DatabaseSync(":memory:");
@@ -75,4 +75,27 @@ test("catalog failure stops before DDL and is never mistaken for SQLite", async 
   };
   await assert.rejects(applyLedgerMigrations(db, ["ALTER TABLE agents ADD COLUMN peak REAL"]), error => error === failure);
   assert.equal(executions, 0);
+});
+
+test("a non-ALTER migration that throws is skipped as before, and said by its index alone", async () => {
+  const raw = new DatabaseSync(":memory:");
+  const db = wrapSqlite(raw);
+  const lines: string[] = [];
+  try {
+    await db.exec("CREATE TABLE flows (tx_hash TEXT)");
+    await db.prepare("INSERT INTO flows VALUES (?)").run("0xABC-secret-row");
+    await applyLedgerMigrations(db, [
+      "UPDATE flows SET tx_hash = LOWER(tx_hash)",
+      "UPDATE no_such_table SET tx_hash = '0xABC-secret-row'",
+      "ALTER TABLE flows ADD COLUMN chain TEXT",
+    ], (line) => lines.push(line));
+    assert.deepEqual(lines, [ledgerMigrationSkipped(1)]);
+    assert.equal(lines[0], "[warn] ledger migration #1 failed and was skipped; the ledger opened without it");
+    // The migrations around it still ran.
+    const row = await db.prepare("SELECT tx_hash, chain FROM flows").get() as { tx_hash: string; chain: string | null };
+    assert.deepEqual([row.tx_hash, row.chain], ["0xabc-secret-row", null]);
+    lines.length = 0;
+    await applyLedgerMigrations(db, ["UPDATE flows SET tx_hash = LOWER(tx_hash)"], (line) => lines.push(line));
+    assert.deepEqual(lines, [], "nothing to say when every statement runs");
+  } finally { raw.close(); }
 });
